@@ -53,6 +53,15 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
+      - name: Smoke test binary
+        shell: pwsh
+        run: |
+          .\target\release\f2v.exe --version
+          .\target\release\f2v.exe --help | Out-Null
+          .\target\release\f2v.exe encode --help | Out-Null
+          .\target\release\f2v.exe decode --help | Out-Null
+          .\target\release\f2v.exe roundtrip --help | Out-Null
+
       - name: Package artifact
         shell: pwsh
         run: |
@@ -76,6 +85,19 @@ jobs:
           $zipPath = Join-Path $distRoot "f2v-windows-x64.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path (Join-Path $pkgDir "*") -DestinationPath $zipPath
+
+      - name: Validate packaged artifact
+        shell: pwsh
+        run: |
+          $extract = "dist/extracted"
+          if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
+          Expand-Archive -Path "dist/f2v-windows-x64.zip" -DestinationPath $extract
+          if (!(Test-Path (Join-Path $extract "f2v.exe"))) {
+            throw "Artifact missing f2v.exe"
+          }
+          if (!(Test-Path (Join-Path $extract "README.txt"))) {
+            throw "Artifact missing README.txt"
+          }
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
