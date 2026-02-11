@@ -1,8 +1,8 @@
-# f2v
+# ViddyBud
 
 Byte-perfect folder `<->` video codec (`bytes -> RGB frames -> lossless MKV`).
 
-`f2v` can:
+`ViddyBud` can:
 - encode any folder into one or more `.mkv` segments,
 - decode those segments back to the original folder structure,
 - run end-to-end roundtrip verification,
@@ -16,7 +16,7 @@ Byte-perfect folder `<->` video codec (`bytes -> RGB frames -> lossless MKV`).
 
 ## Prerequisites
 
-`f2v` requires:
+`ViddyBud` requires:
 - Rust toolchain (`cargo`, `rustc`)
 - `ffmpeg` available in `PATH`
 
@@ -38,8 +38,8 @@ cargo build --release
 ```
 
 Binary locations:
-- Windows: `target\release\f2v.exe`
-- macOS/Linux: `target/release/f2v`
+- Windows: `target\release\ViddyBud.exe`
+- macOS/Linux: `target/release/ViddyBud`
 
 ## Windows Downloadable Artifact (GitHub Actions)
 
@@ -48,14 +48,14 @@ Every push to `main` runs the workflow:
 
 It:
 - runs `cargo check` + `cargo test`,
-- builds `f2v.exe` on `windows-latest`,
+- builds `ViddyBud.exe` on `windows-latest`,
 - smoke-tests binary execution (`--version`, `--help`),
-- uploads `f2v-windows-x64-<commit_sha>.zip` artifact.
+- uploads `ViddyBud-windows-x64-<commit_sha>.zip` artifact.
 
 Download:
 1. Open repository Actions tab.
 2. Open latest `Windows Artifact` run on `main`.
-3. Download `f2v-windows-x64-<commit_sha>`.
+3. Download `ViddyBud-windows-x64-<commit_sha>`.
 
 ## Quick Start
 
@@ -82,7 +82,7 @@ cargo run -- roundtrip "<input_folder>" "<temp_work_dir>" --mode ffv1
 ## Global
 
 ```text
-f2v <command>
+ViddyBud <command>
 ```
 
 Commands:
@@ -93,7 +93,7 @@ Commands:
 ## `encode`
 
 ```text
-f2v encode <INPUT_FOLDER> <OUTPUT_DIR> [options]
+ViddyBud encode <INPUT_FOLDER> <OUTPUT_DIR> [options]
 ```
 
 Options:
@@ -109,7 +109,7 @@ Options:
 ## `decode`
 
 ```text
-f2v decode <INPUT_DIR> <OUTPUT_FOLDER> [options]
+ViddyBud decode <INPUT_DIR> <OUTPUT_FOLDER> [options]
 ```
 
 Options:
@@ -127,7 +127,7 @@ Options:
 ## `roundtrip`
 
 ```text
-f2v roundtrip <INPUT_FOLDER> <TEMP_DIR> [options]
+ViddyBud roundtrip <INPUT_FOLDER> <TEMP_DIR> [options]
 ```
 
 Options:
@@ -183,7 +183,7 @@ Benchmark protocol:
 - Verify ffmpeg is visible:
   - `ffmpeg -version`
 - Verify CLI:
-  - `f2v --help`
+  - `ViddyBud --help`
 - If debugging decode issues, try:
   - `--decode-engine sequential`
   - `--progress plain`
