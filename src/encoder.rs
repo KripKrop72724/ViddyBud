@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,11 @@ struct ChunkPlan {
 pub struct EncodeIoConfig {
     pub mmap_enabled: bool,
     pub mmap_threshold_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StitchConfig {
+    pub enabled: bool,
 }
 
 impl Default for EncodeIoConfig {
@@ -61,6 +66,7 @@ pub fn encode_folder(
     frame_override: Option<&str>,
     progress: ProgressConfig,
     io_config: EncodeIoConfig,
+    stitch_config: StitchConfig,
 ) -> Result<EncodeSummary> {
     if !input_folder.is_dir() {
         bail!("input_folder must be a directory");
@@ -106,6 +112,14 @@ pub fn encode_folder(
     let dataset_id = random_16();
     let dataset_hex = util::dataset_id_hex(dataset_id);
     let root_name = util::folder_basename(input_folder);
+    let segment_output_dir = if stitch_config.enabled {
+        output_dir.join(format!(".f2v_stitch_tmp_{}", dataset_hex))
+    } else {
+        output_dir.to_path_buf()
+    };
+    if stitch_config.enabled {
+        std::fs::create_dir_all(&segment_output_dir)?;
+    }
 
     // Scan filesystem
     let (dirs, files) = scan_folder(input_folder)?;
@@ -142,7 +156,7 @@ pub fn encode_folder(
     manifest_blob.extend_from_slice(&manifest_json);
 
     progress.log(format!(
-        "Encode plan: total={}GiB files={} segments={} workers={} mode={} frame={}x{}",
+        "Encode plan: total={}GiB files={} segments={} workers={} mode={} frame={}x{} stitch={} strategy={}",
         total_bytes / (1024 * 1024 * 1024),
         files.len(),
         planned_segments,
@@ -150,10 +164,17 @@ pub fn encode_folder(
         mode,
         tune.frame_w,
         tune.frame_h,
+        stitch_config.enabled,
+        if stitch_config.enabled {
+            "multitrack-copy"
+        } else {
+            "none"
+        },
     ));
 
     // Run segment encoders concurrently (N workers)
     // If segments > workers, schedule in waves.
+    let mut segment_paths = vec![PathBuf::new(); segments.len()];
     let mut seg_index = 0usize;
     while seg_index < segments.len() {
         let wave_end = (seg_index + tune.workers).min(segments.len());
@@ -168,10 +189,11 @@ pub fn encode_folder(
         let mut handles = vec![];
         for (i, seg) in wave.iter().enumerate() {
             let seg_id = (seg_index + i) as u32;
-            let out_path = output_dir.join(format!(
+            let out_path = segment_output_dir.join(format!(
                 "{}_{}x{}_part{:04}.mkv",
                 dataset_hex, tune.frame_w, tune.frame_h, seg_id
             ));
+            segment_paths[seg_id as usize] = out_path.clone();
 
             let seg_chunks = seg.clone();
             let manifest_blob = manifest_blob.clone();
@@ -220,6 +242,41 @@ pub fn encode_folder(
         seg_index = wave_end;
     }
 
+    let mut stitched_output = None;
+    let mut stitch_tracks = 0usize;
+    let mut stitch_elapsed = Duration::ZERO;
+    if stitch_config.enabled {
+        let stitched_path = output_dir.join(format!(
+            "{}_{}x{}_stitched.mkv",
+            dataset_hex, tune.frame_w, tune.frame_h
+        ));
+        progress.set_stage("stitch remux");
+        stitch_elapsed = stitch_segments_to_multitrack_mkv(
+            &segment_paths,
+            &stitched_path,
+            &dataset_hex,
+            mode == "raw",
+            &progress,
+        )
+        .with_context(|| {
+            format!(
+                "stitch remux failed: temp_dir={} output={}",
+                segment_output_dir.display(),
+                stitched_path.display()
+            )
+        })?;
+        stitch_tracks = segment_paths.len();
+        stitched_output = Some(stitched_path);
+
+        progress.set_stage("stitch cleanup");
+        std::fs::remove_dir_all(&segment_output_dir).with_context(|| {
+            format!(
+                "stitch cleanup failed (strict single-file guarantee): temp_dir={}",
+                segment_output_dir.display()
+            )
+        })?;
+    }
+
     progress.set_stage("finalize");
     let outcome = reporter.finish(format!(
         "encoded dataset {} into {}",
@@ -244,6 +301,10 @@ pub fn encode_folder(
         mapped_files: io_stats.mapped_files.load(Ordering::Relaxed) as usize,
         mapped_bytes: io_stats.mapped_bytes.load(Ordering::Relaxed),
         mmap_fallbacks: io_stats.mmap_fallbacks.load(Ordering::Relaxed) as usize,
+        stitched: stitch_config.enabled,
+        stitched_output,
+        stitch_tracks,
+        stitch_elapsed,
     })
 }
 
@@ -293,7 +354,12 @@ fn encode_one_segment(
             .arg("pipe:0");
 
         if mode == "raw" {
-            cmd.arg("-c:v").arg("rawvideo").arg("-f").arg("matroska");
+            cmd.arg("-c:v")
+                .arg("rawvideo")
+                .arg("-allow_raw_vfw")
+                .arg("1")
+                .arg("-f")
+                .arg("matroska");
         } else {
             // FFV1 fast lossless defaults
             cmd.arg("-c:v")
@@ -703,6 +769,78 @@ fn random_16() -> [u8; 16] {
     let mut id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut id);
     id
+}
+
+fn stitch_segments_to_multitrack_mkv(
+    segment_paths: &[PathBuf],
+    stitched_output: &Path,
+    dataset_hex: &str,
+    allow_raw_vfw: bool,
+    progress: &ProgressHandle,
+) -> Result<Duration> {
+    let started = Instant::now();
+    let op_id = "stitch";
+    progress.set_operation_status(
+        op_id,
+        format!(
+            "remuxing tracks={} output={}",
+            segment_paths.len(),
+            stitched_output.display()
+        ),
+    );
+
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y");
+    for p in segment_paths {
+        cmd.arg("-i").arg(p);
+    }
+    for idx in 0..segment_paths.len() {
+        cmd.arg("-map").arg(format!("{}:v:0", idx));
+    }
+    cmd.arg("-c").arg("copy");
+    if allow_raw_vfw {
+        cmd.arg("-allow_raw_vfw").arg("1");
+    }
+    cmd.arg("-f")
+        .arg("matroska")
+        .arg("-metadata")
+        .arg("f2v_stitched=1")
+        .arg("-metadata")
+        .arg(format!("f2v_segment_count={}", segment_paths.len()))
+        .arg("-metadata")
+        .arg(format!("f2v_dataset={}", dataset_hex))
+        .arg(stitched_output)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().context("spawn ffmpeg stitch remux")?;
+    let stderr_handle = child.stderr.take().map(spawn_stderr_collector);
+    let status = child.wait().context("wait for ffmpeg stitch remux")?;
+    let stderr_lines = stderr_handle
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    if !status.success() {
+        let tail = if stderr_lines.is_empty() {
+            "<no ffmpeg stderr>".to_string()
+        } else {
+            stderr_lines.join(" | ")
+        };
+        progress.clear_operation(op_id, Some("failed"));
+        bail!(
+            "ffmpeg stitch remux failed output={} tracks={} status={} stderr_tail={}",
+            stitched_output.display(),
+            segment_paths.len(),
+            status,
+            tail
+        );
+    }
+
+    let elapsed = started.elapsed();
+    progress.clear_operation(op_id, Some("done"));
+    Ok(elapsed)
 }
 
 fn spawn_stderr_collector(stderr: impl Read + Send + 'static) -> JoinHandle<Vec<String>> {

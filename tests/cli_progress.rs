@@ -54,6 +54,10 @@ fn roundtrip_help_includes_mode_and_progress_flags() {
         text.contains("--mmap-threshold-mib"),
         "help text missing --mmap-threshold-mib: {text}"
     );
+    assert!(
+        text.contains("--stitch"),
+        "help text missing --stitch: {text}"
+    );
 }
 
 #[test]
@@ -72,6 +76,10 @@ fn encode_help_includes_mmap_flags() {
     assert!(
         text.contains("--no-mmap"),
         "help text missing --no-mmap: {text}"
+    );
+    assert!(
+        text.contains("--stitch"),
+        "help text missing --stitch: {text}"
     );
 }
 
@@ -238,5 +246,204 @@ fn encode_no_mmap_reports_disabled() {
     assert!(
         text.contains("mmap=false"),
         "summary missing mmap=false when --no-mmap is set: {text}"
+    );
+}
+
+#[test]
+fn encode_stitch_produces_single_mkv_and_reports_summary() {
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let input = tmp.path().join("input");
+    let output_dir = tmp.path().join("encoded");
+    fs::create_dir_all(&input).expect("create input dir");
+    write_test_file(&input.join("a.bin"), 3 * 1024 * 1024, 19);
+    write_test_file(&input.join("b.bin"), 2 * 1024 * 1024, 73);
+
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("encode")
+        .arg(&input)
+        .arg(&output_dir)
+        .arg("--mode")
+        .arg("ffv1")
+        .arg("--stitch")
+        .arg("--progress")
+        .arg("quiet")
+        .output()
+        .expect("encode runs");
+    assert!(out.status.success(), "{}", combined_output(&out));
+
+    let mut mkvs = vec![];
+    for entry in fs::read_dir(&output_dir).expect("read output dir") {
+        let path = entry.expect("read entry").path();
+        if path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .as_deref()
+            == Some("mkv")
+        {
+            mkvs.push(path);
+        }
+    }
+    assert_eq!(mkvs.len(), 1, "expected one stitched mkv in output dir");
+    assert!(
+        mkvs[0]
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .contains("_stitched"),
+        "stitched filename should include _stitched: {}",
+        mkvs[0].display()
+    );
+
+    let text = combined_output(&out);
+    assert!(
+        text.contains("stitched=true"),
+        "encode summary missing stitched=true: {text}"
+    );
+    assert!(
+        text.contains("stitch_tracks="),
+        "encode summary missing stitch_tracks: {text}"
+    );
+}
+
+#[test]
+fn decode_accepts_stitched_file_and_reports_input_kind() {
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let input = tmp.path().join("input");
+    let output_dir = tmp.path().join("encoded");
+    let decoded = tmp.path().join("decoded");
+    fs::create_dir_all(&input).expect("create input dir");
+    write_test_file(&input.join("a.bin"), 2 * 1024 * 1024, 41);
+    write_test_file(&input.join("b.bin"), 2 * 1024 * 1024, 87);
+
+    let enc_out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("encode")
+        .arg(&input)
+        .arg(&output_dir)
+        .arg("--mode")
+        .arg("ffv1")
+        .arg("--stitch")
+        .arg("--progress")
+        .arg("quiet")
+        .output()
+        .expect("encode runs");
+    assert!(enc_out.status.success(), "{}", combined_output(&enc_out));
+
+    let stitched = fs::read_dir(&output_dir)
+        .expect("read output dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .as_deref()
+                == Some("mkv")
+        })
+        .expect("stitched mkv exists");
+
+    let dec_out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("decode")
+        .arg(&stitched)
+        .arg(&decoded)
+        .arg("--decode-engine")
+        .arg("parallel")
+        .arg("--progress")
+        .arg("plain")
+        .output()
+        .expect("decode runs");
+    assert!(dec_out.status.success(), "{}", combined_output(&dec_out));
+    let text = combined_output(&dec_out);
+    assert!(
+        text.contains("Decision snapshot:"),
+        "missing decision snapshot: {text}"
+    );
+    assert!(
+        text.contains("stitch=true strategy=multitrack"),
+        "missing stitched decision marker: {text}"
+    );
+    assert!(
+        text.contains("input_kind=stitched_file"),
+        "decode summary missing input_kind=stitched_file: {text}"
+    );
+    assert!(
+        text.contains("source_count="),
+        "decode summary missing source_count: {text}"
+    );
+}
+
+#[test]
+fn roundtrip_stitch_ffv1_succeeds() {
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let input = tmp.path().join("input");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&input).expect("create input dir");
+    write_test_file(&input.join("a.bin"), 1024 * 1024, 12);
+
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("roundtrip")
+        .arg(&input)
+        .arg(&work)
+        .arg("--mode")
+        .arg("ffv1")
+        .arg("--stitch")
+        .arg("--progress")
+        .arg("quiet")
+        .output()
+        .expect("roundtrip ffv1 runs");
+    assert!(out.status.success(), "{}", combined_output(&out));
+    let text = combined_output(&out);
+    assert!(
+        text.contains("Roundtrip: OK"),
+        "roundtrip missing success: {text}"
+    );
+    assert!(
+        text.contains("stitched=true"),
+        "roundtrip encode summary missing stitched=true: {text}"
+    );
+}
+
+#[test]
+fn roundtrip_stitch_raw_succeeds() {
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let input = tmp.path().join("input");
+    let work = tmp.path().join("work");
+    fs::create_dir_all(&input).expect("create input dir");
+    write_test_file(&input.join("tiny.bin"), 256 * 1024, 55);
+
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("roundtrip")
+        .arg(&input)
+        .arg(&work)
+        .arg("--mode")
+        .arg("raw")
+        .arg("--stitch")
+        .arg("--progress")
+        .arg("quiet")
+        .output()
+        .expect("roundtrip raw runs");
+    assert!(out.status.success(), "{}", combined_output(&out));
+    let text = combined_output(&out);
+    assert!(
+        text.contains("Roundtrip: OK"),
+        "roundtrip missing success: {text}"
+    );
+    assert!(
+        text.contains("stitched=true"),
+        "roundtrip encode summary missing stitched=true: {text}"
     );
 }

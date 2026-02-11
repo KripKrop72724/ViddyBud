@@ -62,14 +62,18 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_mmap: bool,
 
+        /// Stitch all encoded segments into a single multi-track MKV output.
+        #[arg(long, default_value_t = false)]
+        stitch: bool,
+
         /// Progress display mode: auto (TTY-aware), rich, plain, quiet.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
     },
 
-    /// Decode a folder containing MKV segments back into the original folder structure
+    /// Decode MKV input back into the original folder structure (input can be a directory or stitched MKV)
     Decode {
-        input_dir: PathBuf,
+        input_path: PathBuf,
         output_folder: PathBuf,
 
         /// Writer worker count override (alias: --writers)
@@ -158,6 +162,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         no_mmap: bool,
 
+        /// Stitch all encoded segments into a single multi-track MKV output.
+        #[arg(long, default_value_t = false)]
+        stitch: bool,
+
         /// Progress display mode: auto (TTY-aware), rich, plain, quiet.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
@@ -180,6 +188,7 @@ fn main() -> Result<()> {
             frame,
             mmap_threshold_mib,
             no_mmap,
+            stitch,
             progress,
         } => {
             let mode = validate_mode(mode)?;
@@ -196,12 +205,13 @@ fn main() -> Result<()> {
                     mmap_enabled: !no_mmap,
                     mmap_threshold_bytes: mmap_threshold_mib.max(1) * 1024 * 1024,
                 },
+                encoder::StitchConfig { enabled: stitch },
             )?;
             print_encode_summary(&summary);
         }
 
         Commands::Decode {
-            input_dir,
+            input_path,
             output_folder,
             writer_workers,
             decode_engine,
@@ -214,7 +224,7 @@ fn main() -> Result<()> {
             progress,
         } => {
             let summary = decoder::decode_folder(
-                &input_dir,
+                &input_path,
                 &output_folder,
                 writer_workers,
                 ProgressConfig::new(progress),
@@ -246,6 +256,7 @@ fn main() -> Result<()> {
             unsafe_skip_crc,
             mmap_threshold_mib,
             no_mmap,
+            stitch,
             progress,
         } => {
             let mode = validate_mode(mode)?;
@@ -274,14 +285,23 @@ fn main() -> Result<()> {
                     mmap_enabled: !no_mmap,
                     mmap_threshold_bytes: mmap_threshold_mib.max(1) * 1024 * 1024,
                 },
+                encoder::StitchConfig { enabled: stitch },
             )?;
             phase_handle.clear_operation("encode", Some("encode complete"));
             phase_handle.inc_bytes(1);
 
             phase_handle.set_stage("phase 2/3: decode");
             phase_handle.set_operation_status("decode", "running");
+            let decode_input = if stitch {
+                enc_summary
+                    .stitched_output
+                    .clone()
+                    .context("stitch enabled but encode summary did not include stitched output")?
+            } else {
+                enc_dir.clone()
+            };
             let dec_summary = decoder::decode_folder(
-                &enc_dir,
+                &decode_input,
                 &dec_dir,
                 writer_workers,
                 progress_cfg,
@@ -338,7 +358,7 @@ fn validate_mode(mode: String) -> Result<String> {
 
 fn print_encode_summary(summary: &EncodeSummary) {
     println!(
-        "Encode summary: dataset={} output={} duration={} throughput={} bytes={} / {} files={} segments={} workers={} warnings={} mmap={} threshold={}MiB mapped_files={} mapped_bytes={} mmap_fallbacks={}",
+        "Encode summary: dataset={} output={} duration={} throughput={} bytes={} / {} files={} segments={} workers={} warnings={} mmap={} threshold={}MiB mapped_files={} mapped_bytes={} mmap_fallbacks={} stitched={} stitch_tracks={} stitch_elapsed={} stitched_output={}",
         summary.dataset_hex,
         summary.output_dir.display(),
         fmt_duration(summary.elapsed),
@@ -354,6 +374,14 @@ fn print_encode_summary(summary: &EncodeSummary) {
         summary.mapped_files,
         HumanBytes(summary.mapped_bytes),
         summary.mmap_fallbacks,
+        summary.stitched,
+        summary.stitch_tracks,
+        fmt_duration(summary.stitch_elapsed),
+        summary
+            .stitched_output
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
     );
     for warning in &summary.warnings {
         println!("  warning: {}", warning);
@@ -362,9 +390,11 @@ fn print_encode_summary(summary: &EncodeSummary) {
 
 fn print_decode_summary(summary: &DecodeSummary) {
     println!(
-        "Decode summary: input={} output={} duration={} throughput={} bytes={} / {} files={} segments={} engine={} crc_enabled={} dec_workers={} wrt_workers={} queue_peak={} queue_budget={} batches={} avg_batch={} warnings={}",
+        "Decode summary: input={} output={} input_kind={} source_count={} duration={} throughput={} bytes={} / {} files={} segments={} engine={} crc_enabled={} dec_workers={} wrt_workers={} queue_peak={} queue_budget={} batches={} avg_batch={} warnings={}",
         summary.input_dir.display(),
         summary.output_dir.display(),
+        summary.input_kind,
+        summary.source_count,
         fmt_duration(summary.elapsed),
         fmt_rate(summary.avg_bytes_per_sec),
         HumanBytes(summary.processed_bytes),

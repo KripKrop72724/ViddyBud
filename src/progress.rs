@@ -102,12 +102,18 @@ pub struct EncodeSummary {
     pub mapped_files: usize,
     pub mapped_bytes: u64,
     pub mmap_fallbacks: usize,
+    pub stitched: bool,
+    pub stitched_output: Option<PathBuf>,
+    pub stitch_tracks: usize,
+    pub stitch_elapsed: Duration,
 }
 
 #[derive(Debug, Clone)]
 pub struct DecodeSummary {
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
+    pub input_kind: String,
+    pub source_count: usize,
     pub total_bytes: u64,
     pub processed_bytes: u64,
     pub file_count: usize,

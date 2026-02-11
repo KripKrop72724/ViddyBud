@@ -1,9 +1,10 @@
-# ViddyBud
+# f2v
 
 Byte-perfect folder `<->` video codec (`bytes -> RGB frames -> lossless MKV`).
 
-`ViddyBud` can:
+`f2v` can:
 - encode any folder into one or more `.mkv` segments,
+- optionally stitch encoded segments into exactly one multi-track MKV,
 - decode those segments back to the original folder structure,
 - run end-to-end roundtrip verification,
 - show rich runtime telemetry (progress, ETA, bottleneck state, idle warnings).
@@ -16,7 +17,7 @@ Byte-perfect folder `<->` video codec (`bytes -> RGB frames -> lossless MKV`).
 
 ## Prerequisites
 
-`ViddyBud` requires:
+`f2v` requires:
 - Rust toolchain (`cargo`, `rustc`)
 - `ffmpeg` available in `PATH`
 
@@ -38,8 +39,8 @@ cargo build --release
 ```
 
 Binary locations:
-- Windows: `target\release\ViddyBud.exe`
-- macOS/Linux: `target/release/ViddyBud`
+- Windows: `target\release\f2v.exe`
+- macOS/Linux: `target/release/f2v`
 
 ## Windows Downloadable Artifact (GitHub Actions)
 
@@ -48,14 +49,14 @@ Every push to `main` runs the workflow:
 
 It:
 - runs `cargo check` + `cargo test`,
-- builds `ViddyBud.exe` on `windows-latest`,
+- builds `f2v.exe` on `windows-latest`,
 - smoke-tests binary execution (`--version`, `--help`),
-- uploads `ViddyBud-windows-x64-<commit_sha>.zip` artifact.
+- uploads `f2v-windows-x64-<commit_sha>.zip` artifact.
 
 Download:
 1. Open repository Actions tab.
 2. Open latest `Windows Artifact` run on `main`.
-3. Download `ViddyBud-windows-x64-<commit_sha>`.
+3. Download `f2v-windows-x64-<commit_sha>`.
 
 ## Quick Start
 
@@ -69,6 +70,9 @@ cargo run -- encode "<input_folder>" "<encoded_output_dir>" --mode ffv1
 
 ```bash
 cargo run -- decode "<encoded_output_dir>" "<decoded_output_folder>" --decode-engine parallel
+
+# decode from stitched single-file output
+cargo run -- decode "<encoded_output_dir>/<dataset>_..._stitched.mkv" "<decoded_output_folder>" --decode-engine parallel
 ```
 
 ### Roundtrip (encode + decode + verify)
@@ -82,7 +86,7 @@ cargo run -- roundtrip "<input_folder>" "<temp_work_dir>" --mode ffv1
 ## Global
 
 ```text
-ViddyBud <command>
+f2v <command>
 ```
 
 Commands:
@@ -93,7 +97,7 @@ Commands:
 ## `encode`
 
 ```text
-ViddyBud encode <INPUT_FOLDER> <OUTPUT_DIR> [options]
+f2v encode <INPUT_FOLDER> <OUTPUT_DIR> [options]
 ```
 
 Options:
@@ -104,12 +108,13 @@ Options:
 - `--frame <4k|sq4k>`: frame preset (`3840x2160` or `4096x4096`)
 - `--mmap-threshold-mib <u64>`: mmap files at/above threshold (default `64`)
 - `--no-mmap`: disable mmap path explicitly
+- `--stitch`: output exactly one stitched multi-track MKV (single-file output)
 - `--progress <auto|rich|plain|quiet>`: progress mode (default `auto`)
 
 ## `decode`
 
 ```text
-ViddyBud decode <INPUT_DIR> <OUTPUT_FOLDER> [options]
+f2v decode <INPUT_PATH> <OUTPUT_FOLDER> [options]
 ```
 
 Options:
@@ -124,10 +129,14 @@ Options:
 - `--unsafe-skip-crc`: disable CRC validation (unsafe, faster)
 - `--progress <auto|rich|plain|quiet>`: progress mode (default `auto`)
 
+`<INPUT_PATH>` may be:
+- a directory containing segment MKVs, or
+- a single stitched multi-track MKV produced by `--stitch`.
+
 ## `roundtrip`
 
 ```text
-ViddyBud roundtrip <INPUT_FOLDER> <TEMP_DIR> [options]
+f2v roundtrip <INPUT_FOLDER> <TEMP_DIR> [options]
 ```
 
 Options:
@@ -143,6 +152,7 @@ Options:
 - `--unsafe-skip-crc`
 - `--mmap-threshold-mib <u64>`: encode-side mmap threshold (default `64`)
 - `--no-mmap`
+- `--stitch`: stitch encode phase output to a single MKV before decode phase
 - `--progress <auto|rich|plain|quiet>`: progress mode (default `auto`)
 
 ## Progress Modes
@@ -183,9 +193,15 @@ Benchmark protocol:
 - Verify ffmpeg is visible:
   - `ffmpeg -version`
 - Verify CLI:
-  - `ViddyBud --help`
+  - `f2v --help`
 - If debugging decode issues, try:
   - `--decode-engine sequential`
   - `--progress plain`
 - Keep CRC on unless explicitly testing unsafe path:
   - do not use `--unsafe-skip-crc` for integrity-sensitive workflows.
+
+## Stitch Notes
+
+- Stitch mode uses stream-copy remux (`-c copy`), not re-encoding, to avoid codec-quality and throughput regressions.
+- Stitch output format is one MKV with multiple video tracks (one track per encoded segment).
+- Decode reads stitched tracks in parallel source scheduling to preserve high throughput characteristics.

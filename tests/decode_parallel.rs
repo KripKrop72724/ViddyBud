@@ -48,6 +48,28 @@ fn read_tree_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
+fn find_single_mkv(dir: &Path) -> PathBuf {
+    let mut mkvs = fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .as_deref()
+                == Some("mkv")
+        })
+        .collect::<Vec<_>>();
+    mkvs.sort();
+    assert_eq!(
+        mkvs.len(),
+        1,
+        "expected exactly one mkv in {}",
+        dir.display()
+    );
+    mkvs.remove(0)
+}
+
 fn assert_tree_equal(
     expected: &BTreeMap<PathBuf, Vec<u8>>,
     actual: &BTreeMap<PathBuf, Vec<u8>>,
@@ -275,4 +297,56 @@ fn parallel_decode_with_small_queue_completes() {
         text.contains("queue_peak="),
         "missing queue metrics in summary: {text}"
     );
+}
+
+#[test]
+fn stitched_file_decode_preserves_bytes_and_reports_source_metrics() {
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let input = tmp.path().join("input");
+    let encoded = tmp.path().join("encoded");
+    let decoded = tmp.path().join("decoded");
+    write_test_tree(&input);
+
+    let enc = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("encode")
+        .arg(&input)
+        .arg(&encoded)
+        .arg("--mode")
+        .arg("ffv1")
+        .arg("--stitch")
+        .arg("--progress")
+        .arg("quiet")
+        .output()
+        .expect("encode run");
+    assert!(enc.status.success(), "{}", combined_output(&enc));
+
+    let stitched = find_single_mkv(&encoded);
+    let dec = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("decode")
+        .arg(&stitched)
+        .arg(&decoded)
+        .arg("--decode-engine")
+        .arg("parallel")
+        .arg("--progress")
+        .arg("plain")
+        .output()
+        .expect("decode stitched run");
+    assert!(dec.status.success(), "{}", combined_output(&dec));
+    let text = combined_output(&dec);
+    assert!(
+        text.contains("input_kind=stitched_file"),
+        "summary missing stitched input kind: {text}"
+    );
+    assert!(
+        text.contains("source_count="),
+        "summary missing source count: {text}"
+    );
+
+    let expected = read_tree_bytes(&input);
+    let actual = read_tree_bytes(&decoded);
+    assert_tree_equal(&expected, &actual, "stitched decode changed bytes");
 }

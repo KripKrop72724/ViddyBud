@@ -9,6 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::ValueEnum;
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use filetime::FileTime;
+use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read};
@@ -66,6 +67,8 @@ struct DecodeRuntimeConfig {
     batch_ms: u64,
     read_ahead_frames: usize,
     crc_enabled: bool,
+    allow_raw_vfw: bool,
+    pix_fmt: &'static str,
 }
 
 #[derive(Debug)]
@@ -109,8 +112,65 @@ struct PendingBatch {
     frame_index: u64,
 }
 
+#[derive(Debug, Clone)]
+enum DecodeSource {
+    SegmentFile {
+        path: PathBuf,
+        segment_id: usize,
+    },
+    StitchedTrack {
+        path: PathBuf,
+        track_index: usize,
+        segment_id: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeProbe {
+    width: u32,
+    height: u32,
+    pix_fmt: &'static str,
+    allow_raw_vfw: bool,
+}
+
+impl DecodeSource {
+    fn path(&self) -> &Path {
+        match self {
+            DecodeSource::SegmentFile { path, .. } => path,
+            DecodeSource::StitchedTrack { path, .. } => path,
+        }
+    }
+
+    fn track_index(&self) -> Option<usize> {
+        match self {
+            DecodeSource::SegmentFile { .. } => None,
+            DecodeSource::StitchedTrack { track_index, .. } => Some(*track_index),
+        }
+    }
+
+    fn display_label(&self) -> String {
+        match self {
+            DecodeSource::SegmentFile { path, segment_id } => format!(
+                "seg={} {}",
+                segment_id,
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            DecodeSource::StitchedTrack {
+                path,
+                track_index,
+                segment_id,
+            } => format!(
+                "seg={} track={} {}",
+                segment_id,
+                track_index,
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+        }
+    }
+}
+
 pub fn decode_folder(
-    input_dir: &Path,
+    input_path: &Path,
     output_folder: &Path,
     writers_override: Option<usize>,
     progress_cfg: ProgressConfig,
@@ -120,27 +180,37 @@ pub fn decode_folder(
 
     let reporter = ProgressReporter::new("decode", 0, progress_cfg);
     let progress = reporter.handle();
-    progress.set_stage("discover segments");
-
-    let mkvs = util::list_mkvs(input_dir)?;
-    if mkvs.is_empty() {
-        bail!("No .mkv files found in {:?}", input_dir);
+    progress.set_stage("discover decode sources");
+    let (sources, input_kind) = discover_decode_sources(input_path)?;
+    if sources.is_empty() {
+        bail!("No decode sources found in {:?}", input_path);
     }
 
     progress.set_stage("detect frame size");
-    let (w, h) = detect_frame_size(&mkvs[0])?;
-    progress.log(format!("Detected frame size: {}x{}", w, h));
+    let probe = detect_frame_size(&sources[0])?;
+    progress.log(format!(
+        "Detected frame size: {}x{} pix_fmt={} allow_raw_vfw={}",
+        probe.width, probe.height, probe.pix_fmt, probe.allow_raw_vfw
+    ));
 
     progress.set_stage("read manifest");
-    let manifest = read_manifest(&mkvs[0], w, h)?;
+    let manifest = read_manifest(
+        &sources[0],
+        probe.width,
+        probe.height,
+        probe.pix_fmt,
+        probe.allow_raw_vfw,
+    )?;
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
     progress.set_total_bytes(total_bytes);
     progress.log(format!(
-        "Manifest: dataset={} segments={} mode={} chunk={}MiB",
+        "Manifest: dataset={} segments={} mode={} chunk={}MiB input_kind={} sources={}",
         util::dataset_id_hex(manifest.dataset_id),
         manifest.planned_segments,
         manifest.mode,
         manifest.chunk_size_bytes / (1024 * 1024),
+        input_kind,
+        sources.len(),
     ));
 
     progress.set_stage("prepare output");
@@ -185,11 +255,18 @@ pub fn decode_folder(
         }
     }
 
-    let tuned = autotune::auto_tune_decode_pipeline(output_folder, mkvs.len())?;
-    let runtime = resolve_runtime_config(perf_cfg, writers_override, tuned, mkvs.len());
+    let tuned = autotune::auto_tune_decode_pipeline(output_folder, sources.len())?;
+    let runtime = resolve_runtime_config(
+        perf_cfg,
+        writers_override,
+        tuned,
+        sources.len(),
+        probe.allow_raw_vfw,
+        probe.pix_fmt,
+    );
 
     progress.log(format!(
-        "Decision snapshot: engine={:?} decode_workers={} writer_workers={} queue={}MiB batch={}MiB/{}ms read_ahead={} crc_enabled={}",
+        "Decision snapshot: engine={:?} decode_workers={} writer_workers={} queue={}MiB batch={}MiB/{}ms read_ahead={} crc_enabled={} allow_raw_vfw={} pix_fmt={} stitch={}",
         runtime.engine,
         runtime.decode_workers,
         runtime.writer_workers,
@@ -198,23 +275,32 @@ pub fn decode_folder(
         runtime.batch_ms,
         runtime.read_ahead_frames,
         runtime.crc_enabled,
+        runtime.allow_raw_vfw,
+        runtime.pix_fmt,
+        if input_kind == "stitched_file" {
+            "true strategy=multitrack"
+        } else {
+            "false strategy=none"
+        },
     ));
 
     let stats = Arc::new(SharedDecodeStats::default());
 
     match runtime.engine {
         DecodeEngine::Sequential => decode_sequential(
-            &mkvs,
-            w,
-            h,
+            &sources,
+            probe.width,
+            probe.height,
             &output_paths,
             runtime.crc_enabled,
+            runtime.allow_raw_vfw,
+            runtime.pix_fmt,
             progress.clone(),
         )?,
         DecodeEngine::Parallel => decode_parallel(
-            &mkvs,
-            w,
-            h,
+            &sources,
+            probe.width,
+            probe.height,
             &output_paths,
             runtime,
             Arc::clone(&stats),
@@ -237,12 +323,14 @@ pub fn decode_folder(
     let batch_bytes = stats.batch_bytes_flushed.load(Ordering::Relaxed);
 
     Ok(DecodeSummary {
-        input_dir: input_dir.to_path_buf(),
+        input_dir: input_path.to_path_buf(),
         output_dir: output_folder.to_path_buf(),
+        input_kind,
+        source_count: sources.len(),
         total_bytes,
         processed_bytes: outcome.processed_bytes,
         file_count: manifest.files.len(),
-        segment_count: mkvs.len(),
+        segment_count: sources.len(),
         decode_workers: runtime.decode_workers,
         writer_workers: runtime.writer_workers,
         queue_peak_bytes: stats.queue_peak_bytes.load(Ordering::Relaxed),
@@ -267,6 +355,8 @@ fn resolve_runtime_config(
     writers_override: Option<usize>,
     tuned: DecodePipelineTune,
     mkv_count: usize,
+    allow_raw_vfw: bool,
+    pix_fmt: &'static str,
 ) -> DecodeRuntimeConfig {
     let decode_workers = perf_cfg
         .decode_workers
@@ -307,11 +397,13 @@ fn resolve_runtime_config(
         batch_ms,
         read_ahead_frames,
         crc_enabled: !perf_cfg.unsafe_skip_crc,
+        allow_raw_vfw,
+        pix_fmt,
     }
 }
 
 fn decode_parallel(
-    mkvs: &[PathBuf],
+    sources: &[DecodeSource],
     w: u32,
     h: u32,
     output_paths: &[Option<PathBuf>],
@@ -362,13 +454,13 @@ fn decode_parallel(
         })
         .collect::<Vec<_>>();
 
-    let mkvs_arc = Arc::new(mkvs.to_vec());
+    let sources_arc = Arc::new(sources.to_vec());
     let tx_arc = Arc::new(writer_txs);
     let next_index = Arc::new(AtomicUsize::new(0));
 
     let decode_handles = (0..runtime.decode_workers)
         .map(|worker_id| {
-            let mkvs_arc = Arc::clone(&mkvs_arc);
+            let sources_arc = Arc::clone(&sources_arc);
             let tx_arc = Arc::clone(&tx_arc);
             let next_index = Arc::clone(&next_index);
             let stats = Arc::clone(&stats);
@@ -383,22 +475,22 @@ fn decode_parallel(
                         break;
                     }
                     let idx = next_index.fetch_add(1, Ordering::Relaxed);
-                    if idx >= mkvs_arc.len() {
+                    if idx >= sources_arc.len() {
                         break;
                     }
-                    let mkv = &mkvs_arc[idx];
+                    let source = &sources_arc[idx];
                     progress.set_operation_status(
                         op_id.clone(),
                         format!(
-                            "mkv={}/{} {}",
+                            "source={}/{} {}",
                             idx + 1,
-                            mkvs_arc.len(),
-                            mkv.file_name().unwrap_or_default().to_string_lossy()
+                            sources_arc.len(),
+                            source.display_label()
                         ),
                     );
 
                     if let Err(err) = decode_one_video_parallel(
-                        mkv,
+                        source,
                         idx,
                         w,
                         h,
@@ -523,7 +615,7 @@ fn decode_parallel(
 
 #[allow(clippy::too_many_arguments)]
 fn decode_one_video_parallel(
-    mkv: &Path,
+    source: &DecodeSource,
     mkv_idx: usize,
     w: u32,
     h: u32,
@@ -534,26 +626,40 @@ fn decode_one_video_parallel(
     operation_id: String,
     cancel: Arc<AtomicBool>,
 ) -> Result<()> {
+    let mkv = source.path();
+    let stream_map = source.track_index();
     let frame_bytes = (w as usize) * (h as usize) * 3;
     let payload_cap = frame_bytes - HEADER_LEN;
 
-    let mut child = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(mkv)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    if runtime.allow_raw_vfw {
+        cmd.arg("-allow_raw_vfw").arg("1");
+    }
+    cmd.arg("-i").arg(mkv);
+    if let Some(track) = stream_map {
+        cmd.arg("-map").arg(format!("0:v:{}", track));
+    }
+    let mut child = cmd
         .arg("-f")
         .arg("rawvideo")
         .arg("-pix_fmt")
-        .arg("rgb24")
+        .arg(runtime.pix_fmt)
         .arg("-s")
         .arg(format!("{}x{}", w, h))
         .arg("pipe:1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawn ffmpeg decode {:?}", mkv))?;
+        .with_context(|| {
+            format!(
+                "spawn ffmpeg decode {:?}{}",
+                mkv,
+                stream_map
+                    .map(|t| format!(" track={}", t))
+                    .unwrap_or_else(String::new)
+            )
+        })?;
 
     let stderr_handle = child.stderr.take().map(spawn_stderr_collector);
 
@@ -699,8 +805,11 @@ fn decode_one_video_parallel(
             stderr_lines.join(" | ")
         };
         bail!(
-            "ffmpeg decode failed mkv={} status={} frames={} stderr_tail={}",
+            "ffmpeg decode failed mkv={}{} status={} frames={} stderr_tail={}",
             mkv.display(),
+            stream_map
+                .map(|t| format!(" track={}", t))
+                .unwrap_or_else(String::new),
             status,
             frame_counter,
             tail
@@ -937,57 +1046,78 @@ fn flush_one_batch(
 }
 
 fn decode_sequential(
-    mkvs: &[PathBuf],
+    sources: &[DecodeSource],
     w: u32,
     h: u32,
     output_paths: &[Option<PathBuf>],
     crc_enabled: bool,
+    allow_raw_vfw: bool,
+    pix_fmt: &'static str,
     progress: ProgressHandle,
 ) -> Result<()> {
-    for (idx, mkv) in mkvs.iter().enumerate() {
+    for (idx, source) in sources.iter().enumerate() {
         let op_id = format!("seq{:04}", idx);
-        progress.set_stage(format!("sequential decode {}/{}", idx + 1, mkvs.len()));
-        progress.set_operation_status(
-            op_id.clone(),
-            format!(
-                "reading {}",
-                mkv.file_name().unwrap_or_default().to_string_lossy()
-            ),
-        );
-        decode_one_video_sequential(mkv, w, h, output_paths, crc_enabled, progress.clone())?;
+        progress.set_stage(format!("sequential decode {}/{}", idx + 1, sources.len()));
+        progress.set_operation_status(op_id.clone(), format!("reading {}", source.display_label()));
+        decode_one_video_sequential(
+            source,
+            w,
+            h,
+            output_paths,
+            crc_enabled,
+            allow_raw_vfw,
+            pix_fmt,
+            progress.clone(),
+        )?;
         progress.clear_operation(&op_id, Some("done"));
     }
     Ok(())
 }
 
 fn decode_one_video_sequential(
-    mkv: &Path,
+    source: &DecodeSource,
     w: u32,
     h: u32,
     output_paths: &[Option<PathBuf>],
     crc_enabled: bool,
+    allow_raw_vfw: bool,
+    pix_fmt: &'static str,
     progress: ProgressHandle,
 ) -> Result<()> {
+    let mkv = source.path();
+    let stream_map = source.track_index();
     let frame_bytes = (w as usize) * (h as usize) * 3;
     let payload_cap = frame_bytes - HEADER_LEN;
 
-    let mut child = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(mkv)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    if allow_raw_vfw {
+        cmd.arg("-allow_raw_vfw").arg("1");
+    }
+    cmd.arg("-i").arg(mkv);
+    if let Some(track) = stream_map {
+        cmd.arg("-map").arg(format!("0:v:{}", track));
+    }
+    let mut child = cmd
         .arg("-f")
         .arg("rawvideo")
         .arg("-pix_fmt")
-        .arg("rgb24")
+        .arg(pix_fmt)
         .arg("-s")
         .arg(format!("{}x{}", w, h))
         .arg("pipe:1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawn ffmpeg decode {:?}", mkv))?;
+        .with_context(|| {
+            format!(
+                "spawn ffmpeg decode {:?}{}",
+                mkv,
+                stream_map
+                    .map(|t| format!(" track={}", t))
+                    .unwrap_or_else(String::new)
+            )
+        })?;
 
     let stderr_handle = child.stderr.take().map(spawn_stderr_collector);
     let mut stdout = child.stdout.take().context("ffmpeg stdout missing")?;
@@ -1074,8 +1204,11 @@ fn decode_one_video_sequential(
             stderr_lines.join(" | ")
         };
         bail!(
-            "ffmpeg decode failed mkv={} status={} stderr_tail={}",
+            "ffmpeg decode failed mkv={}{} status={} stderr_tail={}",
             mkv.display(),
+            stream_map
+                .map(|t| format!(" track={}", t))
+                .unwrap_or_else(String::new),
             status,
             tail
         );
@@ -1199,30 +1332,144 @@ fn record_error(
     cancel.store(true, Ordering::Relaxed);
 }
 
-fn detect_frame_size(mkv: &Path) -> Result<(u32, u32)> {
-    let candidates = [(4096, 4096), (3840, 2160), (1920, 1080), (1280, 720)];
-
-    for (w, h) in candidates {
-        if header_magic_matches(mkv, w, h)? {
-            return Ok((w, h));
-        }
-    }
-    bail!("Could not detect frame size for {:?}", mkv);
+#[derive(Debug, Deserialize)]
+struct FfprobeStreams {
+    streams: Vec<FfprobeStream>,
 }
 
-fn header_magic_matches(mkv: &Path, w: u32, h: u32) -> Result<bool> {
+#[derive(Debug, Deserialize)]
+struct FfprobeStream {
+    codec_type: Option<String>,
+}
+
+fn discover_decode_sources(input_path: &Path) -> Result<(Vec<DecodeSource>, String)> {
+    if input_path.is_dir() {
+        let mkvs = util::list_mkvs(input_path)?;
+        if mkvs.is_empty() {
+            bail!("No .mkv files found in {:?}", input_path);
+        }
+        let sources = mkvs
+            .into_iter()
+            .enumerate()
+            .map(|(idx, path)| DecodeSource::SegmentFile {
+                path,
+                segment_id: idx,
+            })
+            .collect::<Vec<_>>();
+        return Ok((sources, "directory".to_string()));
+    }
+
+    if input_path.is_file() {
+        let ext = input_path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext != "mkv" {
+            bail!(
+                "decode file input must be an .mkv file (got {})",
+                input_path.display()
+            );
+        }
+        let track_count = list_video_track_count(input_path)?;
+        if track_count == 0 {
+            bail!(
+                "No video tracks found in stitched input {}",
+                input_path.display()
+            );
+        }
+        let sources = (0..track_count)
+            .map(|idx| DecodeSource::StitchedTrack {
+                path: input_path.to_path_buf(),
+                track_index: idx,
+                segment_id: idx,
+            })
+            .collect::<Vec<_>>();
+        return Ok((sources, "stitched_file".to_string()));
+    }
+
+    bail!(
+        "decode input path must be a directory or .mkv file: {}",
+        input_path.display()
+    );
+}
+
+fn list_video_track_count(mkv: &Path) -> Result<usize> {
+    let output = Command::new("ffprobe")
+        .arg("-v")
+        .arg("error")
+        .arg("-select_streams")
+        .arg("v")
+        .arg("-show_streams")
+        .arg("-of")
+        .arg("json")
+        .arg(mkv)
+        .output()
+        .with_context(|| format!("spawn ffprobe for {}", mkv.display()))?;
+    if !output.status.success() {
+        bail!(
+            "ffprobe failed for {}: {}",
+            mkv.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    parse_video_track_count(&output.stdout)
+        .with_context(|| format!("parse ffprobe json for {}", mkv.display()))
+}
+
+fn parse_video_track_count(raw: &[u8]) -> Result<usize> {
+    let parsed: FfprobeStreams = serde_json::from_slice(raw)?;
+    Ok(parsed
+        .streams
+        .into_iter()
+        .filter(|s| s.codec_type.as_deref() == Some("video"))
+        .count())
+}
+
+fn detect_frame_size(source: &DecodeSource) -> Result<DecodeProbe> {
+    let candidates = [(4096, 4096), (3840, 2160), (1920, 1080), (1280, 720)];
+    let pix_formats = ["rgb24", "bgr24"];
+    for pix_fmt in pix_formats {
+        for allow_raw_vfw in [false, true] {
+            for (w, h) in candidates {
+                if header_magic_matches(source, w, h, pix_fmt, allow_raw_vfw)? {
+                    return Ok(DecodeProbe {
+                        width: w,
+                        height: h,
+                        pix_fmt,
+                        allow_raw_vfw,
+                    });
+                }
+            }
+        }
+    }
+    bail!("Could not detect frame size for {:?}", source.path());
+}
+
+fn header_magic_matches(
+    source: &DecodeSource,
+    w: u32,
+    h: u32,
+    pix_fmt: &str,
+    allow_raw_vfw: bool,
+) -> Result<bool> {
+    let mkv = source.path();
+    let stream_map = source.track_index();
     let frame_bytes = (w as usize) * (h as usize) * 3;
 
-    let mut child = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(mkv)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    if allow_raw_vfw {
+        cmd.arg("-allow_raw_vfw").arg("1");
+    }
+    cmd.arg("-i").arg(mkv);
+    if let Some(track) = stream_map {
+        cmd.arg("-map").arg(format!("0:v:{}", track));
+    }
+    let mut child = cmd
         .arg("-f")
         .arg("rawvideo")
         .arg("-pix_fmt")
-        .arg("rgb24")
+        .arg(pix_fmt)
         .arg("-s")
         .arg(format!("{}x{}", w, h))
         .arg("pipe:1")
@@ -1241,19 +1488,31 @@ fn header_magic_matches(mkv: &Path, w: u32, h: u32) -> Result<bool> {
     Ok(&buf[0..4] == b"F2V1")
 }
 
-fn read_manifest(mkv: &Path, w: u32, h: u32) -> Result<Manifest> {
+fn read_manifest(
+    source: &DecodeSource,
+    w: u32,
+    h: u32,
+    pix_fmt: &str,
+    allow_raw_vfw: bool,
+) -> Result<Manifest> {
+    let mkv = source.path();
+    let stream_map = source.track_index();
     let frame_bytes = (w as usize) * (h as usize) * 3;
 
-    let mut child = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-i")
-        .arg(mkv)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    if allow_raw_vfw {
+        cmd.arg("-allow_raw_vfw").arg("1");
+    }
+    cmd.arg("-i").arg(mkv);
+    if let Some(track) = stream_map {
+        cmd.arg("-map").arg(format!("0:v:{}", track));
+    }
+    let mut child = cmd
         .arg("-f")
         .arg("rawvideo")
         .arg("-pix_fmt")
-        .arg("rgb24")
+        .arg(pix_fmt)
         .arg("-s")
         .arg(format!("{}x{}", w, h))
         .arg("pipe:1")
@@ -1353,4 +1612,22 @@ fn spawn_stderr_collector(stderr: impl Read + Send + 'static) -> JoinHandle<Vec<
 
         lines.into_iter().collect::<Vec<_>>()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_video_track_count;
+
+    #[test]
+    fn parse_ffprobe_streams_counts_video_tracks() {
+        let raw = br#"{
+            "streams": [
+                {"codec_type":"video"},
+                {"codec_type":"audio"},
+                {"codec_type":"video"}
+            ]
+        }"#;
+        let tracks = parse_video_track_count(raw).expect("parse ffprobe json");
+        assert_eq!(tracks, 2);
+    }
 }
