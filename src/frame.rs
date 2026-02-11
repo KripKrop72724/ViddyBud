@@ -23,11 +23,7 @@ pub struct FrameHeader {
     pub payload_crc32: u32,
 }
 
-pub fn build_frame_bytes(
-    frame_bytes: usize,
-    hdr: &FrameHeader,
-    payload: &[u8],
-) -> Vec<u8> {
+pub fn build_frame_bytes(frame_bytes: usize, hdr: &FrameHeader, payload: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; frame_bytes];
     write_header(&mut out[..HEADER_LEN], hdr);
 
@@ -38,8 +34,12 @@ pub fn build_frame_bytes(
 }
 
 pub fn parse_header(buf: &[u8]) -> Option<FrameHeader> {
-    if buf.len() < HEADER_LEN { return None; }
-    if buf[0..4] != MAGIC { return None; }
+    if buf.len() < HEADER_LEN {
+        return None;
+    }
+    if buf[0..4] != MAGIC {
+        return None;
+    }
 
     let version = u16::from_le_bytes([buf[4], buf[5]]);
     let ft = match buf[6] {

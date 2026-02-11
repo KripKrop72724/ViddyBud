@@ -52,13 +52,21 @@ pub struct RecordParser {
 
 enum State {
     NeedKind,
-    NeedHeader,      // need 20 bytes after kind
-    NeedData { file_id: u32, offset: u64, len: u32, crc: u32 },
+    NeedHeader, // need 20 bytes after kind
+    NeedData {
+        file_id: u32,
+        offset: u64,
+        len: u32,
+        crc: u32,
+    },
 }
 
 impl RecordParser {
     pub fn new() -> Self {
-        Self { buf: Vec::new(), state: State::NeedKind }
+        Self {
+            buf: Vec::new(),
+            state: State::NeedKind,
+        }
     }
 
     pub fn push(&mut self, bytes: &[u8], out: &mut Vec<ChunkTask>) {
@@ -67,7 +75,9 @@ impl RecordParser {
         loop {
             match self.state {
                 State::NeedKind => {
-                    if self.buf.len() < 1 { break; }
+                    if self.buf.len() < 1 {
+                        break;
+                    }
                     let kind = self.buf[0];
                     self.buf.drain(0..1);
                     if kind == REC_END {
@@ -83,17 +93,31 @@ impl RecordParser {
                     }
                 }
                 State::NeedHeader => {
-                    if self.buf.len() < 20 { break; }
+                    if self.buf.len() < 20 {
+                        break;
+                    }
                     let file_id = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
                     let offset = u64::from_le_bytes(self.buf[4..12].try_into().unwrap());
                     let len = u32::from_le_bytes(self.buf[12..16].try_into().unwrap());
                     let crc = u32::from_le_bytes(self.buf[16..20].try_into().unwrap());
                     self.buf.drain(0..20);
-                    self.state = State::NeedData { file_id, offset, len, crc };
+                    self.state = State::NeedData {
+                        file_id,
+                        offset,
+                        len,
+                        crc,
+                    };
                 }
-                State::NeedData { file_id, offset, len, crc } => {
+                State::NeedData {
+                    file_id,
+                    offset,
+                    len,
+                    crc,
+                } => {
                     let need = len as usize;
-                    if self.buf.len() < need { break; }
+                    if self.buf.len() < need {
+                        break;
+                    }
                     let data = self.buf[0..need].to_vec();
                     self.buf.drain(0..need);
 

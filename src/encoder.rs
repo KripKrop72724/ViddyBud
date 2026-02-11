@@ -1,19 +1,19 @@
 use crate::autotune;
 use crate::frame::{self, FrameHeader, FrameType, HEADER_LEN};
 use crate::manifest::{FileEntry, FileScan, Manifest};
+use crate::progress::{EncodeSummary, ProgressConfig, ProgressHandle, ProgressReporter};
 use crate::record;
 use crate::util;
 
 use anyhow::{bail, Context, Result};
-use filetime::FileTime;
-use indicatif::{ProgressBar, ProgressStyle};
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -32,11 +32,16 @@ pub fn encode_folder(
     chunk_mib_override: Option<u64>,
     segment_gib_override: Option<u64>,
     frame_override: Option<&str>,
-) -> Result<()> {
+    progress: ProgressConfig,
+) -> Result<EncodeSummary> {
     if !input_folder.is_dir() {
         bail!("input_folder must be a directory");
     }
     std::fs::create_dir_all(output_dir)?;
+
+    let reporter = ProgressReporter::new("encode", 0, progress);
+    let progress = reporter.handle();
+    progress.set_stage("scan");
 
     let mut tune = autotune::auto_tune_for_encode(input_folder)?;
 
@@ -51,8 +56,14 @@ pub fn encode_folder(
     }
     if let Some(fr) = frame_override {
         match fr.to_lowercase().as_str() {
-            "4k" => { tune.frame_w = 3840; tune.frame_h = 2160; }
-            "sq4k" => { tune.frame_w = 4096; tune.frame_h = 4096; }
+            "4k" => {
+                tune.frame_w = 3840;
+                tune.frame_h = 2160;
+            }
+            "sq4k" => {
+                tune.frame_w = 4096;
+                tune.frame_h = 4096;
+            }
             _ => bail!("frame must be '4k' or 'sq4k'"),
         }
     }
@@ -64,13 +75,12 @@ pub fn encode_folder(
     // Scan filesystem
     let (dirs, files) = scan_folder(input_folder)?;
     let total_bytes: u64 = files.iter().map(|f| f.entry.size).sum();
+    progress.set_total_bytes(total_bytes);
+
+    progress.set_stage("plan");
 
     // Plan chunk assignments into segments (keeps file order -> more sequential IO)
-    let segments = plan_segments(
-        &files,
-        tune.chunk_size_bytes,
-        tune.segment_payload_bytes,
-    )?;
+    let segments = plan_segments(&files, tune.chunk_size_bytes, tune.segment_payload_bytes)?;
     let planned_segments = segments.len() as u32;
 
     let created = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
@@ -96,27 +106,29 @@ pub fn encode_folder(
     manifest_blob.extend_from_slice(&(manifest_json.len() as u64).to_le_bytes());
     manifest_blob.extend_from_slice(&manifest_json);
 
-    eprintln!(
-        "Encode plan: total={}GiB files={} segments={} workers={}",
+    progress.log(format!(
+        "Encode plan: total={}GiB files={} segments={} workers={} mode={} frame={}x{}",
         total_bytes / (1024 * 1024 * 1024),
         files.len(),
         planned_segments,
-        tune.workers
-    );
-
-    // Progress
-    let pb = ProgressBar::new(total_bytes);
-    pb.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] {wide_bar} {bytes}/{total_bytes} ({bytes_per_sec})")
-            .unwrap(),
-    );
+        tune.workers,
+        mode,
+        tune.frame_w,
+        tune.frame_h,
+    ));
 
     // Run segment encoders concurrently (N workers)
-    // If segments > workers, we schedule in waves
+    // If segments > workers, schedule in waves.
     let mut seg_index = 0usize;
     while seg_index < segments.len() {
         let wave_end = (seg_index + tune.workers).min(segments.len());
         let wave = &segments[seg_index..wave_end];
+
+        progress.set_stage(format!(
+            "encode wave {}/{}",
+            (seg_index / tune.workers) + 1,
+            segments.len().div_ceil(tune.workers)
+        ));
 
         let mut handles = vec![];
         for (i, seg) in wave.iter().enumerate() {
@@ -128,12 +140,22 @@ pub fn encode_folder(
 
             let seg_chunks = seg.clone();
             let manifest_blob = manifest_blob.clone();
-            let pb = pb.clone();
+            let progress = progress.clone();
             let dataset_id = dataset_id;
             let mode = mode.to_string();
             let w = tune.frame_w;
             let h = tune.frame_h;
             let fps = tune.fps;
+            let op_id = format!("seg{:04}", seg_id);
+
+            progress.set_operation_status(
+                op_id.clone(),
+                format!(
+                    "queued chunks={} output={}",
+                    seg_chunks.len(),
+                    out_path.display()
+                ),
+            );
 
             handles.push(std::thread::spawn(move || -> Result<()> {
                 encode_one_segment(
@@ -146,7 +168,8 @@ pub fn encode_folder(
                     seg_id,
                     &manifest_blob,
                     &seg_chunks,
-                    pb,
+                    progress,
+                    &op_id,
                     tune.workers,
                 )
             }));
@@ -159,11 +182,29 @@ pub fn encode_folder(
         seg_index = wave_end;
     }
 
-    pb.finish_with_message("done");
-    println!("Encoded dataset {} into {}", dataset_hex, output_dir.display());
-    Ok(())
+    progress.set_stage("finalize");
+    let outcome = reporter.finish(format!(
+        "encoded dataset {} into {}",
+        dataset_hex,
+        output_dir.display()
+    ));
+
+    Ok(EncodeSummary {
+        dataset_hex,
+        output_dir: output_dir.to_path_buf(),
+        total_bytes,
+        processed_bytes: outcome.processed_bytes,
+        file_count: files.len(),
+        segment_count: planned_segments as usize,
+        workers: tune.workers,
+        elapsed: outcome.elapsed,
+        avg_bytes_per_sec: outcome.avg_bytes_per_sec,
+        warning_count: outcome.warning_count,
+        warnings: outcome.warnings,
+    })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_one_segment(
     out_path: &Path,
     mode: &str,
@@ -174,96 +215,163 @@ fn encode_one_segment(
     video_id: u32,
     manifest_blob: &[u8],
     chunks: &[ChunkPlan],
-    pb: ProgressBar,
+    progress: ProgressHandle,
+    operation_id: &str,
     total_workers: usize,
 ) -> Result<()> {
-    let frame_bytes = (w as usize) * (h as usize) * 3;
-    if frame_bytes <= HEADER_LEN + 1024 {
-        bail!("frame too small");
-    }
-    let payload_cap = frame_bytes - HEADER_LEN;
+    let operation_id = operation_id.to_string();
+    let result: Result<()> = (|| {
+        let frame_bytes = (w as usize) * (h as usize) * 3;
+        if frame_bytes <= HEADER_LEN + 1024 {
+            bail!("frame too small");
+        }
+        let payload_cap = frame_bytes - HEADER_LEN;
 
-    // Limit ffmpeg threads per process so multiple segments don't each steal all cores.
-    let cores = num_cpus::get().max(1);
-    let per_proc_threads = (cores / total_workers.max(1)).max(1);
+        // Limit ffmpeg threads per process so multiple segments don't each steal all cores.
+        let cores = num_cpus::get().max(1);
+        let per_proc_threads = (cores / total_workers.max(1)).max(1);
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-hide_banner")
-        .arg("-loglevel").arg("error")
-        .arg("-y")
-        .arg("-f").arg("rawvideo")
-        .arg("-pix_fmt").arg("rgb24")
-        .arg("-s").arg(format!("{}x{}", w, h))
-        .arg("-r").arg(fps.to_string())
-        .arg("-i").arg("pipe:0");
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("rgb24")
+            .arg("-s")
+            .arg(format!("{}x{}", w, h))
+            .arg("-r")
+            .arg(fps.to_string())
+            .arg("-i")
+            .arg("pipe:0");
 
-    if mode == "raw" {
-        cmd.arg("-c:v").arg("rawvideo")
-            .arg("-f").arg("matroska");
-    } else {
-        // FFV1 fast lossless defaults
-        cmd.arg("-c:v").arg("ffv1")
-            .arg("-level").arg("3")
-            .arg("-coder").arg("1")
-            .arg("-context").arg("1")
-            .arg("-slicecrc").arg("1")
-            .arg("-threads").arg(per_proc_threads.to_string())
-            .arg("-slices").arg(std::cmp::min(32, per_proc_threads * 2).to_string())
-            .arg("-f").arg("matroska");
-    }
+        if mode == "raw" {
+            cmd.arg("-c:v").arg("rawvideo").arg("-f").arg("matroska");
+        } else {
+            // FFV1 fast lossless defaults
+            cmd.arg("-c:v")
+                .arg("ffv1")
+                .arg("-level")
+                .arg("3")
+                .arg("-coder")
+                .arg("1")
+                .arg("-context")
+                .arg("1")
+                .arg("-slicecrc")
+                .arg("1")
+                .arg("-threads")
+                .arg(per_proc_threads.to_string())
+                .arg("-slices")
+                .arg(std::cmp::min(32, per_proc_threads * 2).to_string())
+                .arg("-f")
+                .arg("matroska");
+        }
 
-    cmd.arg(out_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        cmd.arg(out_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
-    let stdin = child.stdin.take().unwrap();
-    let mut wtr = BufWriter::with_capacity(8 * 1024 * 1024, stdin);
+        progress.set_operation_status(operation_id.clone(), "spawning ffmpeg".to_string());
 
-    // ---- 1) Write MANIFEST frames (type=Manifest) ----
-    let mut frame_index = 0u64;
-    let mut stream_offset = 0u64;
+        let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
+        let stdin = child.stdin.take().context("ffmpeg stdin missing")?;
+        let mut wtr = BufWriter::with_capacity(8 * 1024 * 1024, stdin);
 
-    let mut pos = 0usize;
-    while pos < manifest_blob.len() {
-        let take = (manifest_blob.len() - pos).min(payload_cap);
-        let payload = &manifest_blob[pos..pos + take];
+        let stderr_handle = child.stderr.take().map(spawn_stderr_collector);
 
-        let hdr = FrameHeader {
-            version: 1,
-            frame_type: FrameType::Manifest,
-            flags: 0,
-            dataset_id,
-            video_id,
-            frame_index,
-            stream_offset,
-            payload_len: take as u32,
-            payload_crc32: frame::crc32(payload),
-        };
+        // ---- 1) Write MANIFEST frames (type=Manifest) ----
+        let mut frame_index = 0u64;
+        let mut stream_offset = 0u64;
 
-        let frame = frame::build_frame_bytes(frame_bytes, &hdr, payload);
-        wtr.write_all(&frame)?;
+        progress.set_operation_status(operation_id.clone(), "writing manifest".to_string());
 
-        pos += take;
-        frame_index += 1;
-        stream_offset += take as u64;
-    }
+        let mut pos = 0usize;
+        while pos < manifest_blob.len() {
+            let take = (manifest_blob.len() - pos).min(payload_cap);
+            let payload = &manifest_blob[pos..pos + take];
 
-    // ---- 2) Write DATA frames (records packed into payload stream) ----
-    let mut packer = FramePacker::new(frame_bytes, payload_cap);
+            let hdr = FrameHeader {
+                version: 1,
+                frame_type: FrameType::Manifest,
+                flags: 0,
+                dataset_id,
+                video_id,
+                frame_index,
+                stream_offset,
+                payload_len: take as u32,
+                payload_crc32: frame::crc32(payload),
+            };
 
-    // reuse open files for speed
-    let mut open_files: HashMap<PathBuf, File> = HashMap::new();
+            let frame = frame::build_frame_bytes(frame_bytes, &hdr, payload);
+            wtr.write_all(&frame)?;
 
-    for ch in chunks {
-        let data = read_chunk(&mut open_files, &ch.abs_path, ch.offset, ch.len as usize)?;
-        pb.inc(data.len() as u64);
+            pos += take;
+            frame_index += 1;
+            stream_offset += take as u64;
+        }
 
-        let rec = record::build_data_record(ch.file_id, ch.offset, &data);
-        packer.push_bytes(&rec);
+        // ---- 2) Write DATA frames (records packed into payload stream) ----
+        let mut packer = FramePacker::new(payload_cap);
 
-        while let Some(payload) = packer.take_full_payload() {
+        // reuse open files for speed
+        let mut open_files: HashMap<PathBuf, File> = HashMap::new();
+        let total_chunk_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum();
+        let mut written_chunk_bytes = 0u64;
+        let mut last_status_update = Instant::now();
+
+        for (chunk_idx, ch) in chunks.iter().enumerate() {
+            let data = read_chunk(&mut open_files, &ch.abs_path, ch.offset, ch.len as usize)?;
+            progress.inc_bytes(data.len() as u64);
+            written_chunk_bytes = written_chunk_bytes.saturating_add(data.len() as u64);
+
+            if chunk_idx == 0 || last_status_update.elapsed().as_millis() > 900 {
+                let pct = if total_chunk_bytes == 0 {
+                    100.0
+                } else {
+                    (written_chunk_bytes as f64 / total_chunk_bytes as f64) * 100.0
+                };
+                progress.set_operation_status(
+                    operation_id.clone(),
+                    format!(
+                        "encoding {:.1}% chunks={}/{}",
+                        pct,
+                        chunk_idx + 1,
+                        chunks.len()
+                    ),
+                );
+                last_status_update = Instant::now();
+            }
+
+            let rec = record::build_data_record(ch.file_id, ch.offset, &data);
+            packer.push_bytes(&rec);
+
+            while let Some(payload) = packer.take_full_payload() {
+                let hdr = FrameHeader {
+                    version: 1,
+                    frame_type: FrameType::Data,
+                    flags: 0,
+                    dataset_id,
+                    video_id,
+                    frame_index,
+                    stream_offset,
+                    payload_len: payload.len() as u32,
+                    payload_crc32: frame::crc32(&payload),
+                };
+                let frame = frame::build_frame_bytes(frame_bytes, &hdr, &payload);
+                wtr.write_all(&frame)?;
+                frame_index += 1;
+                stream_offset += payload.len() as u64;
+            }
+        }
+
+        // End record (optional marker)
+        packer.push_bytes(&record::build_end_record());
+
+        // flush remaining partial payload
+        if let Some(payload) = packer.take_any_payload() {
             let hdr = FrameHeader {
                 version: 1,
                 frame_type: FrameType::Data,
@@ -280,53 +388,56 @@ fn encode_one_segment(
             frame_index += 1;
             stream_offset += payload.len() as u64;
         }
-    }
 
-    // End record (optional marker)
-    packer.push_bytes(&record::build_end_record());
-
-    // flush remaining partial payload
-    if let Some(payload) = packer.take_any_payload() {
+        // ---- 3) Write END frame ----
         let hdr = FrameHeader {
             version: 1,
-            frame_type: FrameType::Data,
+            frame_type: FrameType::End,
             flags: 0,
             dataset_id,
             video_id,
             frame_index,
             stream_offset,
-            payload_len: payload.len() as u32,
-            payload_crc32: frame::crc32(&payload),
+            payload_len: 0,
+            payload_crc32: 0,
         };
-        let frame = frame::build_frame_bytes(frame_bytes, &hdr, &payload);
-        wtr.write_all(&frame)?;
-        frame_index += 1;
-        stream_offset += payload.len() as u64;
+        let end_frame = frame::build_frame_bytes(frame_bytes, &hdr, &[]);
+        wtr.write_all(&end_frame)?;
+        wtr.flush()?;
+        drop(wtr);
+
+        progress.set_operation_status(operation_id.clone(), "waiting for ffmpeg".to_string());
+        let status = child.wait()?;
+        let stderr_lines = stderr_handle
+            .map(|h| h.join().unwrap_or_default())
+            .unwrap_or_default();
+        if !status.success() {
+            let tail = if stderr_lines.is_empty() {
+                "<no ffmpeg stderr>".to_string()
+            } else {
+                stderr_lines.join(" | ")
+            };
+            bail!(
+                "ffmpeg failed for segment={} out={} status={} stderr_tail={}",
+                video_id,
+                out_path.display(),
+                status,
+                tail
+            );
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            progress.clear_operation(&operation_id, Some("done"));
+            Ok(())
+        }
+        Err(err) => {
+            progress.clear_operation(&operation_id, Some("failed"));
+            Err(err)
+        }
     }
-
-    // ---- 3) Write END frame ----
-    let hdr = FrameHeader {
-        version: 1,
-        frame_type: FrameType::End,
-        flags: 0,
-        dataset_id,
-        video_id,
-        frame_index,
-        stream_offset,
-        payload_len: 0,
-        payload_crc32: 0,
-    };
-    let end_frame = frame::build_frame_bytes(frame_bytes, &hdr, &[]);
-    wtr.write_all(&end_frame)?;
-    wtr.flush()?;
-
-    drop(wtr);
-
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("ffmpeg failed for {:?}", out_path);
-    }
-    Ok(())
 }
 
 struct FramePacker {
@@ -335,8 +446,11 @@ struct FramePacker {
 }
 
 impl FramePacker {
-    fn new(_frame_bytes: usize, payload_cap: usize) -> Self {
-        Self { payload_cap, cur: Vec::with_capacity(payload_cap) }
+    fn new(payload_cap: usize) -> Self {
+        Self {
+            payload_cap,
+            cur: Vec::with_capacity(payload_cap),
+        }
     }
 
     fn push_bytes(&mut self, bytes: &[u8]) {
@@ -345,21 +459,37 @@ impl FramePacker {
 
     fn take_full_payload(&mut self) -> Option<Vec<u8>> {
         if self.cur.len() >= self.payload_cap {
-            let out = self.cur.drain(0..self.payload_cap).collect::<Vec<u8>>();
-            Some(out)
+            Some(self.cur.drain(0..self.payload_cap).collect::<Vec<u8>>())
         } else {
             None
         }
     }
 
     fn take_any_payload(&mut self) -> Option<Vec<u8>> {
-        if self.cur.is_empty() { None } else { Some(std::mem::take(&mut self.cur)) }
+        if self.cur.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.cur))
+        }
     }
 }
 
-fn read_chunk(open_files: &mut HashMap<PathBuf, File>, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
-    let f = open_files.entry(path.to_path_buf()).or_insert_with(|| File::open(path).unwrap());
+fn read_chunk(
+    open_files: &mut HashMap<PathBuf, File>,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> Result<Vec<u8>> {
+    if !open_files.contains_key(path) {
+        let file = File::open(path).with_context(|| format!("open {:?}", path))?;
+        open_files.insert(path.to_path_buf(), file);
+    }
+
+    let f = open_files
+        .get_mut(path)
+        .context("chunk file missing from cache")?;
     f.seek(SeekFrom::Start(offset))?;
+
     let mut buf = vec![0u8; len];
     f.read_exact(&mut buf)?;
     Ok(buf)
@@ -383,7 +513,9 @@ fn scan_folder(root: &Path) -> Result<(Vec<String>, Vec<FileScan>)> {
             dirs.push(rel);
         } else if p.is_file() {
             let meta = std::fs::metadata(p)?;
-            let mtime = meta.modified().ok()
+            let mtime = meta
+                .modified()
+                .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
@@ -394,7 +526,10 @@ fn scan_folder(root: &Path) -> Result<(Vec<String>, Vec<FileScan>)> {
                 size: meta.len(),
                 mtime_unix: mtime,
             };
-            files.push(FileScan { entry: fe, abs_path: p.to_path_buf() });
+            files.push(FileScan {
+                entry: fe,
+                abs_path: p.to_path_buf(),
+            });
             id += 1;
         }
     }
@@ -405,7 +540,11 @@ fn scan_folder(root: &Path) -> Result<(Vec<String>, Vec<FileScan>)> {
     Ok((dirs, files))
 }
 
-fn plan_segments(files: &[FileScan], chunk_size: u64, target_payload: u64) -> Result<Vec<Vec<ChunkPlan>>> {
+fn plan_segments(
+    files: &[FileScan],
+    chunk_size: u64,
+    target_payload: u64,
+) -> Result<Vec<Vec<ChunkPlan>>> {
     // Estimate record overhead per chunk
     const REC_OVERHEAD: u64 = 1 + 4 + 8 + 4 + 4; // kind + file_id + offset + len + crc
 
@@ -447,4 +586,30 @@ fn random_16() -> [u8; 16] {
     let mut id = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut id);
     id
+}
+
+fn spawn_stderr_collector(stderr: impl Read + Send + 'static) -> JoinHandle<Vec<String>> {
+    std::thread::spawn(move || {
+        let mut lines = VecDeque::new();
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            let cleaned = line.trim().to_string();
+            if cleaned.is_empty() {
+                continue;
+            }
+            lines.push_back(cleaned);
+            if lines.len() > 20 {
+                lines.pop_front();
+            }
+        }
+
+        lines.into_iter().collect::<Vec<_>>()
+    })
 }

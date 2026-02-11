@@ -1,7 +1,10 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 use walkdir::WalkDir;
+
+use crate::progress::VerifySummary;
 
 pub fn ensure_ffmpeg_available() -> Result<()> {
     let out = Command::new("ffmpeg")
@@ -42,7 +45,12 @@ pub fn list_mkvs(dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Simple “did we reconstruct the same file tree sizes?”
-pub fn basic_verify_structure(src_root: &Path, dst_root: &Path) -> Result<()> {
+pub fn basic_verify_structure(src_root: &Path, dst_root: &Path) -> Result<VerifySummary> {
+    let started = Instant::now();
+    let mut checked_dirs = 0usize;
+    let mut checked_files = 0usize;
+    let mut checked_bytes = 0u64;
+
     for entry in WalkDir::new(src_root) {
         let e = entry?;
         let src = e.path();
@@ -53,6 +61,7 @@ pub fn basic_verify_structure(src_root: &Path, dst_root: &Path) -> Result<()> {
             if !dst.is_dir() {
                 bail!("Missing dir: {:?}", dst);
             }
+            checked_dirs += 1;
         } else if src.is_file() {
             let s1 = std::fs::metadata(src)?.len();
             let s2 = std::fs::metadata(&dst)
@@ -61,7 +70,22 @@ pub fn basic_verify_structure(src_root: &Path, dst_root: &Path) -> Result<()> {
             if s1 != s2 {
                 bail!("Size mismatch for {:?}: {} vs {}", rel, s1, s2);
             }
+            checked_files += 1;
+            checked_bytes = checked_bytes.saturating_add(s1);
         }
     }
-    Ok(())
+    let elapsed = started.elapsed();
+    let avg_bytes_per_sec = if elapsed.as_secs_f64() <= f64::EPSILON {
+        checked_bytes as f64
+    } else {
+        checked_bytes as f64 / elapsed.as_secs_f64()
+    };
+
+    Ok(VerifySummary {
+        checked_dirs,
+        checked_files,
+        checked_bytes,
+        elapsed,
+        avg_bytes_per_sec,
+    })
 }

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
 use sysinfo::System;
@@ -9,7 +9,6 @@ use walkdir::WalkDir;
 #[derive(Debug, Clone)]
 pub struct Tune {
     pub workers: usize,
-    pub writers: usize,
     pub chunk_size_bytes: u64,
     pub segment_payload_bytes: u64,
     pub frame_w: u32,
@@ -73,9 +72,6 @@ pub fn auto_tune_for_encode(input_folder: &Path) -> Result<Tune> {
     // Higher FPS makes videos shorter for same data (purely cosmetic)
     let fps = 60;
 
-    // Writers for decode are separate, but pick a hint
-    let writers = workers.max(2).min(8);
-
     eprintln!(
         "Auto-tune (encode): cores={} ram_total={}GiB avail={}GiB read≈{:.0}MB/s disk_class={} workers={} chunk={}MiB segment≈{}GiB frame={}x{} fps={}",
         cores,
@@ -92,7 +88,6 @@ pub fn auto_tune_for_encode(input_folder: &Path) -> Result<Tune> {
 
     Ok(Tune {
         workers,
-        writers,
         chunk_size_bytes,
         segment_payload_bytes,
         frame_w,
@@ -122,7 +117,7 @@ pub fn auto_tune_for_decode(output_folder: &Path) -> Result<usize> {
     eprintln!(
         "Auto-tune (decode): cores={} avail={}GiB writers={} write≈{:.0}MB/s",
         cores,
-        avail / (1024*1024*1024),
+        avail / (1024 * 1024 * 1024),
         writers,
         write_mb_s
     );
