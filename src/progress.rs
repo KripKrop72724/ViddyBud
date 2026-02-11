@@ -97,6 +97,11 @@ pub struct EncodeSummary {
     pub avg_bytes_per_sec: f64,
     pub warning_count: usize,
     pub warnings: Vec<String>,
+    pub mmap_enabled: bool,
+    pub mmap_threshold_bytes: u64,
+    pub mapped_files: usize,
+    pub mapped_bytes: u64,
+    pub mmap_fallbacks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +112,14 @@ pub struct DecodeSummary {
     pub processed_bytes: u64,
     pub file_count: usize,
     pub segment_count: usize,
-    pub writers: usize,
+    pub decode_workers: usize,
+    pub writer_workers: usize,
+    pub queue_peak_bytes: u64,
+    pub queue_budget_bytes: u64,
+    pub batches_flushed: u64,
+    pub avg_batch_bytes: u64,
+    pub engine: String,
+    pub crc_enabled: bool,
     pub elapsed: Duration,
     pub avg_bytes_per_sec: f64,
     pub warning_count: usize,
@@ -339,6 +351,15 @@ impl ProgressHandle {
 
     pub fn log(&self, message: impl Into<String>) {
         self.inner.emit_message("INFO", &message.into());
+    }
+
+    pub fn warning(&self, message: impl Into<String>) {
+        let msg = message.into();
+        {
+            let mut state = self.inner.state.lock().unwrap();
+            push_warning_locked(&mut state, &msg);
+        }
+        self.inner.emit_message("WARN", &msg);
     }
 }
 

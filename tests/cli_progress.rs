@@ -42,6 +42,37 @@ fn roundtrip_help_includes_mode_and_progress_flags() {
         text.contains("--progress"),
         "help text missing --progress: {text}"
     );
+    assert!(
+        text.contains("--decode-engine"),
+        "help text missing --decode-engine: {text}"
+    );
+    assert!(
+        text.contains("--writer-workers"),
+        "help text missing --writer-workers: {text}"
+    );
+    assert!(
+        text.contains("--mmap-threshold-mib"),
+        "help text missing --mmap-threshold-mib: {text}"
+    );
+}
+
+#[test]
+fn encode_help_includes_mmap_flags() {
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("encode")
+        .arg("--help")
+        .output()
+        .expect("encode --help runs");
+    assert!(output.status.success());
+    let text = combined_output(&output);
+    assert!(
+        text.contains("--mmap-threshold-mib"),
+        "help text missing --mmap-threshold-mib: {text}"
+    );
+    assert!(
+        text.contains("--no-mmap"),
+        "help text missing --no-mmap: {text}"
+    );
 }
 
 #[test]
@@ -110,6 +141,16 @@ fn decode_plain_progress_includes_eta_and_summary() {
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded)
+        .arg("--decode-engine")
+        .arg("parallel")
+        .arg("--queue-mib")
+        .arg("64")
+        .arg("--batch-bytes")
+        .arg("1048576")
+        .arg("--batch-ms")
+        .arg("10")
+        .arg("--read-ahead-frames")
+        .arg("2")
         .arg("--progress")
         .arg("plain")
         .output()
@@ -124,6 +165,14 @@ fn decode_plain_progress_includes_eta_and_summary() {
     );
     assert!(text.contains("ETA="), "missing ETA token: {text}");
     assert!(text.contains("Decode summary:"), "missing summary: {text}");
+    assert!(
+        text.contains("Decision snapshot:"),
+        "missing decision snapshot: {text}"
+    );
+    assert!(
+        text.contains("bottleneck="),
+        "missing bottleneck telemetry: {text}"
+    );
 }
 
 #[test]
@@ -157,5 +206,37 @@ fn decode_failure_reports_contextual_path_details() {
     assert!(
         text.contains("broken.mkv"),
         "missing file path context: {text}"
+    );
+}
+
+#[test]
+fn encode_no_mmap_reports_disabled() {
+    if !ffmpeg_available() {
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tempdir");
+    let input = tmp.path().join("input");
+    let output_dir = tmp.path().join("encoded");
+    fs::create_dir_all(&input).expect("create input dir");
+    write_test_file(&input.join("a.bin"), 2 * 1024 * 1024, 99);
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+        .arg("encode")
+        .arg(&input)
+        .arg(&output_dir)
+        .arg("--mode")
+        .arg("ffv1")
+        .arg("--no-mmap")
+        .arg("--progress")
+        .arg("quiet")
+        .output()
+        .expect("encode runs");
+    assert!(output.status.success(), "{}", combined_output(&output));
+
+    let text = combined_output(&output);
+    assert!(
+        text.contains("mmap=false"),
+        "summary missing mmap=false when --no-mmap is set: {text}"
     );
 }

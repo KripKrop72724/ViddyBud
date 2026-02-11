@@ -6,12 +6,15 @@ use crate::record;
 use crate::util;
 
 use anyhow::{bail, Context, Result};
+use memmap2::MmapOptions;
 use rand::RngCore;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -24,6 +27,30 @@ struct ChunkPlan {
     len: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeIoConfig {
+    pub mmap_enabled: bool,
+    pub mmap_threshold_bytes: u64,
+}
+
+impl Default for EncodeIoConfig {
+    fn default() -> Self {
+        Self {
+            mmap_enabled: true,
+            mmap_threshold_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EncodeIoStats {
+    mapped_files: AtomicU64,
+    mapped_bytes: AtomicU64,
+    mmap_fallbacks: AtomicU64,
+    mapped_seen: Mutex<HashSet<PathBuf>>,
+    fallback_seen: Mutex<HashSet<PathBuf>>,
+}
+
 pub fn encode_folder(
     input_folder: &Path,
     output_dir: &Path,
@@ -33,6 +60,7 @@ pub fn encode_folder(
     segment_gib_override: Option<u64>,
     frame_override: Option<&str>,
     progress: ProgressConfig,
+    io_config: EncodeIoConfig,
 ) -> Result<EncodeSummary> {
     if !input_folder.is_dir() {
         bail!("input_folder must be a directory");
@@ -42,6 +70,13 @@ pub fn encode_folder(
     let reporter = ProgressReporter::new("encode", 0, progress);
     let progress = reporter.handle();
     progress.set_stage("scan");
+    let io_stats = Arc::new(EncodeIoStats {
+        mapped_files: AtomicU64::new(0),
+        mapped_bytes: AtomicU64::new(0),
+        mmap_fallbacks: AtomicU64::new(0),
+        mapped_seen: Mutex::new(HashSet::new()),
+        fallback_seen: Mutex::new(HashSet::new()),
+    });
 
     let mut tune = autotune::auto_tune_for_encode(input_folder)?;
 
@@ -147,6 +182,7 @@ pub fn encode_folder(
             let h = tune.frame_h;
             let fps = tune.fps;
             let op_id = format!("seg{:04}", seg_id);
+            let io_stats = Arc::clone(&io_stats);
 
             progress.set_operation_status(
                 op_id.clone(),
@@ -171,6 +207,8 @@ pub fn encode_folder(
                     progress,
                     &op_id,
                     tune.workers,
+                    io_config,
+                    io_stats,
                 )
             }));
         }
@@ -201,6 +239,11 @@ pub fn encode_folder(
         avg_bytes_per_sec: outcome.avg_bytes_per_sec,
         warning_count: outcome.warning_count,
         warnings: outcome.warnings,
+        mmap_enabled: io_config.mmap_enabled,
+        mmap_threshold_bytes: io_config.mmap_threshold_bytes,
+        mapped_files: io_stats.mapped_files.load(Ordering::Relaxed) as usize,
+        mapped_bytes: io_stats.mapped_bytes.load(Ordering::Relaxed),
+        mmap_fallbacks: io_stats.mmap_fallbacks.load(Ordering::Relaxed) as usize,
     })
 }
 
@@ -218,6 +261,8 @@ fn encode_one_segment(
     progress: ProgressHandle,
     operation_id: &str,
     total_workers: usize,
+    io_config: EncodeIoConfig,
+    io_stats: Arc<EncodeIoStats>,
 ) -> Result<()> {
     let operation_id = operation_id.to_string();
     let result: Result<()> = (|| {
@@ -317,13 +362,21 @@ fn encode_one_segment(
         let mut packer = FramePacker::new(payload_cap);
 
         // reuse open files for speed
-        let mut open_files: HashMap<PathBuf, File> = HashMap::new();
+        let mut open_sources: HashMap<PathBuf, SourceReader> = HashMap::new();
         let total_chunk_bytes: u64 = chunks.iter().map(|c| c.len as u64).sum();
         let mut written_chunk_bytes = 0u64;
         let mut last_status_update = Instant::now();
 
         for (chunk_idx, ch) in chunks.iter().enumerate() {
-            let data = read_chunk(&mut open_files, &ch.abs_path, ch.offset, ch.len as usize)?;
+            let data = read_chunk(
+                &mut open_sources,
+                &ch.abs_path,
+                ch.offset,
+                ch.len as usize,
+                io_config,
+                &io_stats,
+                &progress,
+            )?;
             progress.inc_bytes(data.len() as u64);
             written_chunk_bytes = written_chunk_bytes.saturating_add(data.len() as u64);
 
@@ -474,25 +527,89 @@ impl FramePacker {
     }
 }
 
+enum SourceReader {
+    File(File),
+    Mmap(memmap2::Mmap),
+}
+
 fn read_chunk(
-    open_files: &mut HashMap<PathBuf, File>,
+    open_sources: &mut HashMap<PathBuf, SourceReader>,
     path: &Path,
     offset: u64,
     len: usize,
+    io_config: EncodeIoConfig,
+    io_stats: &Arc<EncodeIoStats>,
+    progress: &ProgressHandle,
 ) -> Result<Vec<u8>> {
-    if !open_files.contains_key(path) {
-        let file = File::open(path).with_context(|| format!("open {:?}", path))?;
-        open_files.insert(path.to_path_buf(), file);
+    if !open_sources.contains_key(path) {
+        let mut inserted = false;
+        if io_config.mmap_enabled {
+            let meta = std::fs::metadata(path).with_context(|| format!("metadata {:?}", path))?;
+            if meta.len() >= io_config.mmap_threshold_bytes {
+                match File::open(path)
+                    .with_context(|| format!("open {:?} for mmap", path))
+                    .and_then(|f| unsafe {
+                        MmapOptions::new()
+                            .map(&f)
+                            .with_context(|| format!("mmap {:?}", path))
+                    }) {
+                    Ok(map) => {
+                        open_sources.insert(path.to_path_buf(), SourceReader::Mmap(map));
+                        inserted = true;
+                        let mut seen = io_stats.mapped_seen.lock().unwrap();
+                        if seen.insert(path.to_path_buf()) {
+                            io_stats.mapped_files.fetch_add(1, Ordering::Relaxed);
+                            io_stats
+                                .mapped_bytes
+                                .fetch_add(meta.len(), Ordering::Relaxed);
+                        }
+                    }
+                    Err(err) => {
+                        let mut seen = io_stats.fallback_seen.lock().unwrap();
+                        if seen.insert(path.to_path_buf()) {
+                            io_stats.mmap_fallbacks.fetch_add(1, Ordering::Relaxed);
+                            progress.warning(format!(
+                                "mmap fallback for {} ({})",
+                                path.display(),
+                                err
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !inserted {
+            let file = File::open(path).with_context(|| format!("open {:?}", path))?;
+            open_sources.insert(path.to_path_buf(), SourceReader::File(file));
+        }
     }
 
-    let f = open_files
+    let src = open_sources
         .get_mut(path)
-        .context("chunk file missing from cache")?;
-    f.seek(SeekFrom::Start(offset))?;
-
-    let mut buf = vec![0u8; len];
-    f.read_exact(&mut buf)?;
-    Ok(buf)
+        .context("chunk source missing from cache")?;
+    match src {
+        SourceReader::Mmap(map) => {
+            let start = offset as usize;
+            let end = start.saturating_add(len);
+            if end > map.len() {
+                bail!(
+                    "mmap out-of-bounds read path={} start={} len={} map_len={}",
+                    path.display(),
+                    start,
+                    len,
+                    map.len()
+                );
+            }
+            Ok(map[start..end].to_vec())
+        }
+        SourceReader::File(f) => {
+            f.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; len];
+            f.read_exact(&mut buf)?;
+            Ok(buf)
+        }
+    }
 }
 
 fn scan_folder(root: &Path) -> Result<(Vec<String>, Vec<FileScan>)> {

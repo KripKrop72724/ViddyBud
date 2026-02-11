@@ -44,15 +44,17 @@ pub struct ChunkTask {
     pub expected_crc32: u32,
 }
 
-/// Streaming parser that consumes bytes and yields complete ChunkTask(s)
+/// Streaming parser that consumes bytes and yields complete ChunkTask(s).
+/// Uses a cursor + occasional compaction to avoid frequent front-drain memmoves.
 pub struct RecordParser {
     buf: Vec<u8>,
+    pos: usize,
     state: State,
 }
 
 enum State {
     NeedKind,
-    NeedHeader, // need 20 bytes after kind
+    NeedHeader,
     NeedData {
         file_id: u32,
         offset: u64,
@@ -65,6 +67,7 @@ impl RecordParser {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
+            pos: 0,
             state: State::NeedKind,
         }
     }
@@ -75,32 +78,38 @@ impl RecordParser {
         loop {
             match self.state {
                 State::NeedKind => {
-                    if self.buf.len() < 1 {
+                    if self.available() < 1 {
                         break;
                     }
-                    let kind = self.buf[0];
-                    self.buf.drain(0..1);
+                    let kind = self.buf[self.pos];
+                    self.pos += 1;
+
                     if kind == REC_END {
-                        // ignore, stream end marker
+                        // stream end marker
                         continue;
-                    } else if kind == REC_DATA {
+                    }
+                    if kind == REC_DATA {
                         self.state = State::NeedHeader;
-                    } else {
-                        // unknown -> drop
-                        self.state = State::NeedKind;
-                        self.buf.clear();
-                        break;
+                        continue;
                     }
+
+                    // Unknown data => reset parser state.
+                    self.state = State::NeedKind;
+                    self.buf.clear();
+                    self.pos = 0;
+                    break;
                 }
+
                 State::NeedHeader => {
-                    if self.buf.len() < 20 {
+                    if self.available() < 20 {
                         break;
                     }
-                    let file_id = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
-                    let offset = u64::from_le_bytes(self.buf[4..12].try_into().unwrap());
-                    let len = u32::from_le_bytes(self.buf[12..16].try_into().unwrap());
-                    let crc = u32::from_le_bytes(self.buf[16..20].try_into().unwrap());
-                    self.buf.drain(0..20);
+                    let p = self.pos;
+                    let file_id = u32::from_le_bytes(self.buf[p..p + 4].try_into().unwrap());
+                    let offset = u64::from_le_bytes(self.buf[p + 4..p + 12].try_into().unwrap());
+                    let len = u32::from_le_bytes(self.buf[p + 12..p + 16].try_into().unwrap());
+                    let crc = u32::from_le_bytes(self.buf[p + 16..p + 20].try_into().unwrap());
+                    self.pos += 20;
                     self.state = State::NeedData {
                         file_id,
                         offset,
@@ -108,6 +117,7 @@ impl RecordParser {
                         crc,
                     };
                 }
+
                 State::NeedData {
                     file_id,
                     offset,
@@ -115,11 +125,14 @@ impl RecordParser {
                     crc,
                 } => {
                     let need = len as usize;
-                    if self.buf.len() < need {
+                    if self.available() < need {
                         break;
                     }
-                    let data = self.buf[0..need].to_vec();
-                    self.buf.drain(0..need);
+
+                    let start = self.pos;
+                    let end = start + need;
+                    let data = self.buf[start..end].to_vec();
+                    self.pos = end;
 
                     out.push(ChunkTask {
                         file_id,
@@ -127,10 +140,68 @@ impl RecordParser {
                         data,
                         expected_crc32: crc,
                     });
-
                     self.state = State::NeedKind;
                 }
             }
         }
+
+        self.compact_if_needed();
+    }
+
+    fn available(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+
+    fn compact_if_needed(&mut self) {
+        if self.pos == 0 {
+            return;
+        }
+
+        if self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            return;
+        }
+
+        // Compact once consumed prefix gets large to avoid unbounded growth.
+        if self.pos >= (self.buf.len() / 2) || self.pos >= (1 << 20) {
+            self.buf.copy_within(self.pos.., 0);
+            let new_len = self.buf.len() - self.pos;
+            self.buf.truncate(new_len);
+            self.pos = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_records_across_fragmented_pushes() {
+        let rec1 = build_data_record(7, 10, b"abc");
+        let rec2 = build_data_record(8, 20, b"xyz1");
+
+        let mut parser = RecordParser::new();
+        let mut out = vec![];
+
+        let mut stream = vec![];
+        stream.extend_from_slice(&rec1);
+        stream.extend_from_slice(&rec2);
+        stream.extend_from_slice(&build_end_record());
+
+        parser.push(&stream[..5], &mut out);
+        assert_eq!(out.len(), 0);
+        parser.push(&stream[5..11], &mut out);
+        assert_eq!(out.len(), 0);
+        parser.push(&stream[11..], &mut out);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].file_id, 7);
+        assert_eq!(out[0].offset, 10);
+        assert_eq!(out[0].data, b"abc");
+        assert_eq!(out[1].file_id, 8);
+        assert_eq!(out[1].offset, 20);
+        assert_eq!(out[1].data, b"xyz1");
     }
 }

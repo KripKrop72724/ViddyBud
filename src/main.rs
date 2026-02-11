@@ -54,6 +54,14 @@ enum Commands {
         #[arg(long)]
         frame: Option<String>,
 
+        /// Use mmap for files >= this threshold in MiB.
+        #[arg(long, default_value_t = 64)]
+        mmap_threshold_mib: u64,
+
+        /// Disable mmap reads in encode path.
+        #[arg(long, default_value_t = false)]
+        no_mmap: bool,
+
         /// Progress display mode: auto (TTY-aware), rich, plain, quiet.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
@@ -64,9 +72,37 @@ enum Commands {
         input_dir: PathBuf,
         output_folder: PathBuf,
 
-        /// Optional override writer threads. Default: auto.
+        /// Writer worker count override (alias: --writers)
+        #[arg(long, alias = "writers")]
+        writer_workers: Option<usize>,
+
+        /// Decode engine: parallel (default) or sequential fallback.
+        #[arg(long, value_enum, default_value_t = decoder::DecodeEngine::Parallel)]
+        decode_engine: decoder::DecodeEngine,
+
+        /// Decoder worker count override.
         #[arg(long)]
-        writers: Option<usize>,
+        decode_workers: Option<usize>,
+
+        /// Queue budget in MiB for decode->writer pipeline.
+        #[arg(long)]
+        queue_mib: Option<u64>,
+
+        /// Flush batch size in bytes.
+        #[arg(long)]
+        batch_bytes: Option<u64>,
+
+        /// Flush timeout in milliseconds.
+        #[arg(long)]
+        batch_ms: Option<u64>,
+
+        /// Per-decoder read-ahead frame queue depth.
+        #[arg(long)]
+        read_ahead_frames: Option<usize>,
+
+        /// Disable payload/chunk CRC validation (unsafe, faster).
+        #[arg(long, default_value_t = false)]
+        unsafe_skip_crc: bool,
 
         /// Progress display mode: auto (TTY-aware), rich, plain, quiet.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
@@ -82,6 +118,46 @@ enum Commands {
         #[arg(long, default_value = "ffv1")]
         mode: String,
 
+        /// Decode engine: parallel (default) or sequential fallback.
+        #[arg(long, value_enum, default_value_t = decoder::DecodeEngine::Parallel)]
+        decode_engine: decoder::DecodeEngine,
+
+        /// Decoder worker count override.
+        #[arg(long)]
+        decode_workers: Option<usize>,
+
+        /// Writer worker count override (alias: --writers)
+        #[arg(long, alias = "writers")]
+        writer_workers: Option<usize>,
+
+        /// Queue budget in MiB for decode->writer pipeline.
+        #[arg(long)]
+        queue_mib: Option<u64>,
+
+        /// Flush batch size in bytes.
+        #[arg(long)]
+        batch_bytes: Option<u64>,
+
+        /// Flush timeout in milliseconds.
+        #[arg(long)]
+        batch_ms: Option<u64>,
+
+        /// Per-decoder read-ahead frame queue depth.
+        #[arg(long)]
+        read_ahead_frames: Option<usize>,
+
+        /// Disable payload/chunk CRC validation (unsafe, faster).
+        #[arg(long, default_value_t = false)]
+        unsafe_skip_crc: bool,
+
+        /// Use mmap for files >= this threshold in MiB.
+        #[arg(long, default_value_t = 64)]
+        mmap_threshold_mib: u64,
+
+        /// Disable mmap reads in encode path.
+        #[arg(long, default_value_t = false)]
+        no_mmap: bool,
+
         /// Progress display mode: auto (TTY-aware), rich, plain, quiet.
         #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
         progress: ProgressMode,
@@ -91,7 +167,6 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Basic ffmpeg availability check (encode/decode both need it)
     util::ensure_ffmpeg_available().context("ffmpeg not found in PATH")?;
 
     match cli.cmd {
@@ -103,6 +178,8 @@ fn main() -> Result<()> {
             chunk_mib,
             segment_gib,
             frame,
+            mmap_threshold_mib,
+            no_mmap,
             progress,
         } => {
             let mode = validate_mode(mode)?;
@@ -115,6 +192,10 @@ fn main() -> Result<()> {
                 segment_gib,
                 frame.as_deref(),
                 ProgressConfig::new(progress),
+                encoder::EncodeIoConfig {
+                    mmap_enabled: !no_mmap,
+                    mmap_threshold_bytes: mmap_threshold_mib.max(1) * 1024 * 1024,
+                },
             )?;
             print_encode_summary(&summary);
         }
@@ -122,14 +203,31 @@ fn main() -> Result<()> {
         Commands::Decode {
             input_dir,
             output_folder,
-            writers,
+            writer_workers,
+            decode_engine,
+            decode_workers,
+            queue_mib,
+            batch_bytes,
+            batch_ms,
+            read_ahead_frames,
+            unsafe_skip_crc,
             progress,
         } => {
             let summary = decoder::decode_folder(
                 &input_dir,
                 &output_folder,
-                writers,
+                writer_workers,
                 ProgressConfig::new(progress),
+                decoder::DecodePerfConfig {
+                    engine: decode_engine,
+                    decode_workers,
+                    writer_workers,
+                    queue_mib,
+                    batch_bytes,
+                    batch_ms,
+                    read_ahead_frames,
+                    unsafe_skip_crc,
+                },
             )?;
             print_decode_summary(&summary);
         }
@@ -138,6 +236,16 @@ fn main() -> Result<()> {
             input_folder,
             temp_dir,
             mode,
+            decode_engine,
+            decode_workers,
+            writer_workers,
+            queue_mib,
+            batch_bytes,
+            batch_ms,
+            read_ahead_frames,
+            unsafe_skip_crc,
+            mmap_threshold_mib,
+            no_mmap,
             progress,
         } => {
             let mode = validate_mode(mode)?;
@@ -162,13 +270,32 @@ fn main() -> Result<()> {
                 None,
                 None,
                 progress_cfg,
+                encoder::EncodeIoConfig {
+                    mmap_enabled: !no_mmap,
+                    mmap_threshold_bytes: mmap_threshold_mib.max(1) * 1024 * 1024,
+                },
             )?;
             phase_handle.clear_operation("encode", Some("encode complete"));
             phase_handle.inc_bytes(1);
 
             phase_handle.set_stage("phase 2/3: decode");
             phase_handle.set_operation_status("decode", "running");
-            let dec_summary = decoder::decode_folder(&enc_dir, &dec_dir, None, progress_cfg)?;
+            let dec_summary = decoder::decode_folder(
+                &enc_dir,
+                &dec_dir,
+                writer_workers,
+                progress_cfg,
+                decoder::DecodePerfConfig {
+                    engine: decode_engine,
+                    decode_workers,
+                    writer_workers,
+                    queue_mib,
+                    batch_bytes,
+                    batch_ms,
+                    read_ahead_frames,
+                    unsafe_skip_crc,
+                },
+            )?;
             phase_handle.clear_operation("decode", Some("decode complete"));
             phase_handle.inc_bytes(1);
 
@@ -211,7 +338,7 @@ fn validate_mode(mode: String) -> Result<String> {
 
 fn print_encode_summary(summary: &EncodeSummary) {
     println!(
-        "Encode summary: dataset={} output={} duration={} throughput={} bytes={} / {} files={} segments={} workers={} warnings={}",
+        "Encode summary: dataset={} output={} duration={} throughput={} bytes={} / {} files={} segments={} workers={} warnings={} mmap={} threshold={}MiB mapped_files={} mapped_bytes={} mmap_fallbacks={}",
         summary.dataset_hex,
         summary.output_dir.display(),
         fmt_duration(summary.elapsed),
@@ -222,6 +349,11 @@ fn print_encode_summary(summary: &EncodeSummary) {
         summary.segment_count,
         summary.workers,
         summary.warning_count,
+        summary.mmap_enabled,
+        summary.mmap_threshold_bytes / (1024 * 1024),
+        summary.mapped_files,
+        HumanBytes(summary.mapped_bytes),
+        summary.mmap_fallbacks,
     );
     for warning in &summary.warnings {
         println!("  warning: {}", warning);
@@ -230,7 +362,7 @@ fn print_encode_summary(summary: &EncodeSummary) {
 
 fn print_decode_summary(summary: &DecodeSummary) {
     println!(
-        "Decode summary: input={} output={} duration={} throughput={} bytes={} / {} files={} segments={} writers={} warnings={}",
+        "Decode summary: input={} output={} duration={} throughput={} bytes={} / {} files={} segments={} engine={} crc_enabled={} dec_workers={} wrt_workers={} queue_peak={} queue_budget={} batches={} avg_batch={} warnings={}",
         summary.input_dir.display(),
         summary.output_dir.display(),
         fmt_duration(summary.elapsed),
@@ -239,7 +371,14 @@ fn print_decode_summary(summary: &DecodeSummary) {
         HumanBytes(summary.total_bytes),
         summary.file_count,
         summary.segment_count,
-        summary.writers,
+        summary.engine,
+        summary.crc_enabled,
+        summary.decode_workers,
+        summary.writer_workers,
+        HumanBytes(summary.queue_peak_bytes),
+        HumanBytes(summary.queue_budget_bytes),
+        summary.batches_flushed,
+        HumanBytes(summary.avg_batch_bytes),
         summary.warning_count,
     );
     for warning in &summary.warnings {
