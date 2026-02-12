@@ -2,8 +2,6 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
   pull_request:
 
 permissions:
@@ -82,4 +80,3 @@ jobs:
         run: |
           ./target/release/viddybud --version
           ./target/release/viddybud --help >/dev/null
-
