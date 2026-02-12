@@ -1,0 +1,402 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build artifacts and generate manifests, but do not publish release or packages."
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_TAP_REPO: KripKrop72724/homebrew-viddybud
+  HOMEBREW_FORMULA_PATH: Formula/viddybud.rb
+  SCOOP_BUCKET_REPO: KripKrop72724/scoop-viddybud
+  SCOOP_MANIFEST_PATH: bucket/viddybud.json
+  WINGET_PACKAGE_ID: ViddyBud.ViddyBud
+
+jobs:
+  validate_version:
+    name: Validate Version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+      dry_run: ${{ steps.flags.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine dry run
+        id: flags
+        shell: bash
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "dry_run=${DRY_RUN_INPUT}" >>"$GITHUB_OUTPUT"
+          else
+            echo "dry_run=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve tag + version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/resolve_version.sh Cargo.toml
+
+  test_gate:
+    name: Test Gate
+    runs-on: ubuntu-latest
+    needs: validate_version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo fmt
+        run: cargo fmt -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --locked
+
+  build_matrix:
+    name: Build (${{ matrix.asset }})
+    needs: [validate_version, test_gate]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-x64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: macos-x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.validate_version.outputs.version }}"
+          $target = "${{ matrix.target }}"
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+
+          $srcExe = "target/$target/release/viddybud.exe"
+          $verExe = "$dist/viddybud-v$version-windows-x64.exe"
+          Copy-Item $srcExe $verExe -Force
+
+          $pkgDir = Join-Path $dist "viddybud-windows-x64"
+          New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
+          Copy-Item $srcExe (Join-Path $pkgDir "viddybud.exe") -Force
+
+          $readme = @"
+          ViddyBud (portable)
+          Version: v$version
+
+          Prerequisites:
+          - ffmpeg.exe in PATH
+
+          Quick start:
+          - .\\viddybud.exe --help
+          "@
+          Set-Content -Path (Join-Path $pkgDir "README.txt") -Value $readme
+
+          $zipPath = "$dist/viddybud-v$version-windows-x64.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path (Join-Path $pkgDir "*") -DestinationPath $zipPath
+
+          .\target\$target\release\viddybud.exe --version | Out-Null
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate_version.outputs.version }}"
+          target="${{ matrix.target }}"
+          asset="${{ matrix.asset }}"
+          dist="dist"
+          mkdir -p "$dist"
+
+          bin="target/$target/release/viddybud"
+          chmod +x "$bin"
+          tar -C "target/$target/release" -czf "$dist/viddybud-v${version}-${asset}.tar.gz" viddybud
+
+          "$bin" --version >/dev/null
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  package_assets:
+    name: Package Assets + Draft Release
+    runs-on: ubuntu-latest
+    needs: [validate_version, build_matrix]
+    outputs:
+      dist_artifact_name: release-dist
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/generate_checksums.sh dist
+          ls -la dist
+
+      - name: Upload dist bundle (for downstream jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create draft GitHub release
+        if: needs.validate_version.outputs.dry_run != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate_version.outputs.tag }}
+          name: ViddyBud ${{ needs.validate_version.outputs.tag }}
+          draft: true
+          files: dist/*
+
+  publish_homebrew:
+    name: Publish Homebrew (Tap)
+    runs-on: ubuntu-latest
+    needs: [validate_version, package_assets]
+    if: needs.validate_version.outputs.dry_run != 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Compute source tarball SHA256
+        id: srcsha
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate_version.outputs.tag }}"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${tag}.tar.gz"
+          curl -fsSL "$url" -o source.tar.gz
+          sha="$(sha256sum source.tar.gz | awk '{print $1}')"
+          echo "tarball_sha256=$sha" >>"$GITHUB_OUTPUT"
+
+      - name: Generate formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate_version.outputs.version }}"
+          python3 scripts/release/generate_homebrew_formula.py \
+            --template packaging/homebrew/viddybud.rb.tpl \
+            --version "$version" \
+            --tarball-sha256 "${{ steps.srcsha.outputs.tarball_sha256 }}" \
+            --out out/viddybud.rb
+
+      - name: Mirror formula to tap repo
+        shell: bash
+        env:
+          PACKAGING_REPO_TOKEN: ${{ secrets.PACKAGING_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate_version.outputs.version }}"
+          scripts/release/mirror_to_repo.sh \
+            --repo "${HOMEBREW_TAP_REPO}" \
+            --src out/viddybud.rb \
+            --dst "${HOMEBREW_FORMULA_PATH}" \
+            --message "viddybud v${version}"
+
+  verify_homebrew:
+    name: Verify Homebrew Install (macOS)
+    runs-on: macos-latest
+    needs: [validate_version, publish_homebrew]
+    if: needs.validate_version.outputs.dry_run != 'true'
+    steps:
+      - name: Tap + install
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew update
+          brew tap KripKrop72724/viddybud
+          brew uninstall --force viddybud >/dev/null 2>&1 || true
+          brew install viddybud
+          viddybud --version >/dev/null
+
+  publish_scoop:
+    name: Publish Scoop (Bucket)
+    runs-on: ubuntu-latest
+    needs: [validate_version, package_assets]
+    if: needs.validate_version.outputs.dry_run != 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download dist bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Extract zip SHA256
+        id: zipsha
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate_version.outputs.version }}"
+          zip="viddybud-v${version}-windows-x64.zip"
+          sha="$(grep "  $zip$" dist/SHA256SUMS.txt | awk '{print $1}')"
+          if [[ -z "$sha" ]]; then
+            echo "could not find sha for $zip in SHA256SUMS.txt" >&2
+            exit 2
+          fi
+          echo "zip_sha256=$sha" >>"$GITHUB_OUTPUT"
+
+      - name: Generate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate_version.outputs.version }}"
+          python3 scripts/release/generate_scoop_manifest.py \
+            --template packaging/scoop/viddybud.json.tpl \
+            --version "$version" \
+            --zip-sha256 "${{ steps.zipsha.outputs.zip_sha256 }}" \
+            --out out/viddybud.json
+
+      - name: Mirror manifest to bucket repo
+        shell: bash
+        env:
+          PACKAGING_REPO_TOKEN: ${{ secrets.PACKAGING_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ needs.validate_version.outputs.version }}"
+          scripts/release/mirror_to_repo.sh \
+            --repo "${SCOOP_BUCKET_REPO}" \
+            --src out/viddybud.json \
+            --dst "${SCOOP_MANIFEST_PATH}" \
+            --message "viddybud v${version}"
+
+  finalize_release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: [validate_version, package_assets, publish_homebrew, publish_scoop, verify_homebrew]
+    if: needs.validate_version.outputs.dry_run != 'true'
+    steps:
+      - name: Publish draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.validate_version.outputs.tag }}"
+          gh release edit "$tag" --draft=false
+
+  publish_winget:
+    name: Publish WinGet (non-blocking)
+    runs-on: windows-latest
+    needs: [validate_version, finalize_release]
+    if: needs.validate_version.outputs.dry_run != 'true' && vars.WINGET_BOOTSTRAPPED == 'true'
+    continue-on-error: true
+    steps:
+      - name: Download wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile "wingetcreate.exe"
+
+      - name: Submit update PR
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if (-not $env:WINGET_TOKEN) {
+            Write-Host "WINGET_TOKEN not set; skipping."
+            exit 0
+          }
+          $tag = "${{ needs.validate_version.outputs.tag }}"
+          $version = "${{ needs.validate_version.outputs.version }}"
+          $url = "https://github.com/${{ github.repository }}/releases/download/$tag/viddybud-v$version-windows-x64.exe"
+          .\wingetcreate.exe update "${{ env.WINGET_PACKAGE_ID }}" -u "$url" -v "$version" -t "$env:WINGET_TOKEN" --submit
+
+  verify_scoop:
+    name: Verify Scoop Install (Windows, non-blocking)
+    runs-on: windows-latest
+    needs: [validate_version, finalize_release]
+    if: needs.validate_version.outputs.dry_run != 'true'
+    continue-on-error: true
+    steps:
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+          Invoke-Expression (New-Object System.Net.WebClient).DownloadString('https://get.scoop.sh')
+
+      - name: Install from bucket
+        shell: pwsh
+        run: |
+          scoop bucket add main | Out-Null
+          scoop bucket add viddybud https://github.com/KripKrop72724/scoop-viddybud | Out-Null
+          scoop install viddybud/viddybud
+          viddybud --version | Out-Null

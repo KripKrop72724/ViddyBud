@@ -32,6 +32,34 @@ Install `ffmpeg`:
 - Ubuntu/Debian:
   - `sudo apt-get update && sudo apt-get install -y ffmpeg`
 
+## Install
+
+### macOS (Homebrew)
+
+```bash
+brew tap KripKrop72724/viddybud
+brew install viddybud
+```
+
+### Windows (WinGet)
+
+```powershell
+winget install --id ViddyBud.ViddyBud
+```
+
+### Windows (Scoop)
+
+```powershell
+scoop bucket add viddybud https://github.com/KripKrop72724/scoop-viddybud.git
+scoop install viddybud/viddybud
+```
+
+## Package Channels Status
+
+- Homebrew (tap): stable releases
+- Scoop (bucket): stable releases
+- WinGet: stable releases (after one-time bootstrap; may lag during review)
+
 ## Build
 
 ```bash
@@ -42,21 +70,21 @@ Binary locations:
 - Windows: `target\release\viddybud.exe`
 - macOS/Linux: `target/release/viddybud`
 
-## Windows Downloadable Artifact (GitHub Actions)
+## Releases + Artifacts
 
-Every push to `main` runs the workflow:
-- `.github/workflows/windows-artifact.yml`
+Stable releases are cut from Git tags (`vMAJOR.MINOR.PATCH`) and published to GitHub Releases,
+with packaged binaries and `SHA256SUMS.txt`.
 
-It:
-- runs `cargo check` + `cargo test`,
-- builds `viddybud.exe` on `windows-latest`,
-- smoke-tests binary execution (`--version`, `--help`),
-- uploads `viddybud-windows-x64-<commit_sha>.zip` artifact.
+For development/testing builds, every push to `main` runs:
+- `.github/workflows/windows-artifact.yml` (downloadable Windows zip)
 
 Download:
 1. Open repository Actions tab.
 2. Open latest `ViddyBud Windows Artifact` run on `main`.
 3. Download `viddybud-windows-x64-<commit_sha>`.
+
+Release pipeline docs:
+- `docs/release-pipeline.md`
 
 ## Quick Start
 

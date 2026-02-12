@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test_linux:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo fmt
+        run: cargo fmt -- --check
+
+      - name: Cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Cargo test
+        run: cargo test --locked
+
+  build_windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    needs: test_linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke test binary
+        shell: pwsh
+        run: |
+          .\target\release\viddybud.exe --version
+          .\target\release\viddybud.exe --help | Out-Null
+
+  build_macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+    needs: test_linux
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke test binary
+        run: |
+          ./target/release/viddybud --version
+          ./target/release/viddybud --help >/dev/null
+

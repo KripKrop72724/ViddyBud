@@ -1,0 +1,9 @@
+PackageIdentifier: ViddyBud.ViddyBud
+Publisher: ViddyBud
+Moniker: viddybud
+License: MIT
+Homepage: https://github.com/KripKrop72724/ViddyBud
+InstallerUrlTemplate: https://github.com/KripKrop72724/ViddyBud/releases/download/v{version}/viddybud-v{version}-windows-x64.exe
+Dependencies:
+  - Gyan.FFmpeg
+

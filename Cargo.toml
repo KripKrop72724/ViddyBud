@@ -2,6 +2,11 @@
 name = "viddybud"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "Byte-perfect folder<->video codec (bytes->RGB frames->lossless MKV)"
+repository = "https://github.com/KripKrop72724/ViddyBud"
+homepage = "https://github.com/KripKrop72724/ViddyBud"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"
