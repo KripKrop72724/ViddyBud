@@ -1,6 +1,6 @@
 [package]
 name = "viddybud"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 description = "Byte-perfect folder<->video codec (bytes->RGB frames->lossless MKV)"

@@ -4,6 +4,11 @@ All notable changes to ViddyBud will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows SemVer.
 
+## [0.1.3] - 2026-02-12
+
+### Fixed
+- Release workflow now builds `macos-x64` on `macos-14` (GitHub no longer schedules `macos-13` runners reliably).
+
 ## [0.1.2] - 2026-02-12
 
 ### Fixed
