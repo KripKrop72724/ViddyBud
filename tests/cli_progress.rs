@@ -29,7 +29,7 @@ fn write_test_file(path: &Path, size: usize, seed: u8) {
 
 #[test]
 fn roundtrip_help_includes_mode_and_progress_flags() {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("roundtrip")
         .arg("--help")
         .output()
@@ -62,7 +62,7 @@ fn roundtrip_help_includes_mode_and_progress_flags() {
 
 #[test]
 fn encode_help_includes_mmap_flags() {
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg("--help")
         .output()
@@ -97,7 +97,7 @@ fn encode_plain_progress_includes_eta_and_summary() {
     write_test_file(&input.join("a.bin"), 3 * 1024 * 1024, 11);
     write_test_file(&input.join("b.bin"), 2 * 1024 * 1024, 77);
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&output_dir)
@@ -133,7 +133,7 @@ fn decode_plain_progress_includes_eta_and_summary() {
 
     write_test_file(&input.join("c.bin"), 2 * 1024 * 1024, 31);
 
-    let enc_out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let enc_out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&encoded)
@@ -145,7 +145,7 @@ fn decode_plain_progress_includes_eta_and_summary() {
         .expect("encode runs");
     assert!(enc_out.status.success(), "{}", combined_output(&enc_out));
 
-    let dec_out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let dec_out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded)
@@ -195,7 +195,7 @@ fn decode_failure_reports_contextual_path_details() {
     fs::create_dir_all(&bad_input).expect("create bad dir");
     fs::write(bad_input.join("broken.mkv"), b"not-a-real-mkv").expect("write bad mkv");
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&bad_input)
         .arg(&out)
@@ -229,7 +229,7 @@ fn encode_no_mmap_reports_disabled() {
     fs::create_dir_all(&input).expect("create input dir");
     write_test_file(&input.join("a.bin"), 2 * 1024 * 1024, 99);
 
-    let output = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&output_dir)
@@ -262,7 +262,7 @@ fn encode_stitch_produces_single_mkv_and_reports_summary() {
     write_test_file(&input.join("a.bin"), 3 * 1024 * 1024, 19);
     write_test_file(&input.join("b.bin"), 2 * 1024 * 1024, 73);
 
-    let out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&output_dir)
@@ -323,7 +323,7 @@ fn decode_accepts_stitched_file_and_reports_input_kind() {
     write_test_file(&input.join("a.bin"), 2 * 1024 * 1024, 41);
     write_test_file(&input.join("b.bin"), 2 * 1024 * 1024, 87);
 
-    let enc_out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let enc_out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&output_dir)
@@ -348,7 +348,7 @@ fn decode_accepts_stitched_file_and_reports_input_kind() {
         })
         .expect("stitched mkv exists");
 
-    let dec_out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let dec_out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&stitched)
         .arg(&decoded)
@@ -390,7 +390,7 @@ fn roundtrip_stitch_ffv1_succeeds() {
     fs::create_dir_all(&input).expect("create input dir");
     write_test_file(&input.join("a.bin"), 1024 * 1024, 12);
 
-    let out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("roundtrip")
         .arg(&input)
         .arg(&work)
@@ -425,7 +425,7 @@ fn roundtrip_stitch_raw_succeeds() {
     fs::create_dir_all(&input).expect("create input dir");
     write_test_file(&input.join("tiny.bin"), 256 * 1024, 55);
 
-    let out = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let out = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("roundtrip")
         .arg(&input)
         .arg(&work)

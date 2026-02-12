@@ -113,7 +113,7 @@ pub fn encode_folder(
     let dataset_hex = util::dataset_id_hex(dataset_id);
     let root_name = util::folder_basename(input_folder);
     let segment_output_dir = if stitch_config.enabled {
-        output_dir.join(format!(".f2v_stitch_tmp_{}", dataset_hex))
+        output_dir.join(format!(".viddybud_stitch_tmp_{}", dataset_hex))
     } else {
         output_dir.to_path_buf()
     };
@@ -807,11 +807,11 @@ fn stitch_segments_to_multitrack_mkv(
     cmd.arg("-f")
         .arg("matroska")
         .arg("-metadata")
-        .arg("f2v_stitched=1")
+        .arg("viddybud_stitched=1")
         .arg("-metadata")
-        .arg(format!("f2v_segment_count={}", segment_paths.len()))
+        .arg(format!("viddybud_segment_count={}", segment_paths.len()))
         .arg("-metadata")
-        .arg(format!("f2v_dataset={}", dataset_hex))
+        .arg(format!("viddybud_dataset={}", dataset_hex))
         .arg(stitched_output)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

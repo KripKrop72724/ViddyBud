@@ -18,7 +18,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
-    name = "f2v",
+    name = "ViddyBud",
     version,
     about = "Byte-perfect folder<->video codec (bytes->RGB frames->lossless video)"
 )]

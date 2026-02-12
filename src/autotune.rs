@@ -234,7 +234,7 @@ fn measure_sequential_read_mb_s(root: &Path, max_mib: usize) -> Result<f64> {
 
 fn measure_write_mb_s(dir: &Path, mib: usize) -> Result<f64> {
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(".f2v_write_test.bin");
+    let tmp = dir.join(".viddybud_write_test.bin");
     let total = (mib as u64) * 1024 * 1024;
     let buf = vec![0u8; 8 * 1024 * 1024];
 

@@ -1485,7 +1485,7 @@ fn header_magic_matches(
         return Ok(false);
     }
 
-    Ok(&buf[0..4] == b"F2V1")
+    Ok(&buf[0..4] == frame::MAGIC.as_slice())
 }
 
 fn read_manifest(

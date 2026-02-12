@@ -1,4 +1,4 @@
-name: Windows Artifact
+name: ViddyBud Windows Artifact
 
 on:
   push:
@@ -13,7 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-artifact-${{ github.ref }}
+  group: viddybud-windows-artifact-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -56,33 +56,33 @@ jobs:
       - name: Smoke test binary
         shell: pwsh
         run: |
-          .\target\release\f2v.exe --version
-          .\target\release\f2v.exe --help | Out-Null
-          .\target\release\f2v.exe encode --help | Out-Null
-          .\target\release\f2v.exe decode --help | Out-Null
-          .\target\release\f2v.exe roundtrip --help | Out-Null
+          .\target\release\viddybud.exe --version
+          .\target\release\viddybud.exe --help | Out-Null
+          .\target\release\viddybud.exe encode --help | Out-Null
+          .\target\release\viddybud.exe decode --help | Out-Null
+          .\target\release\viddybud.exe roundtrip --help | Out-Null
 
       - name: Package artifact
         shell: pwsh
         run: |
           $distRoot = "dist"
-          $pkgDir = Join-Path $distRoot "f2v-windows-x64"
+          $pkgDir = Join-Path $distRoot "viddybud-windows-x64"
           New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
-          Copy-Item "target/release/f2v.exe" (Join-Path $pkgDir "f2v.exe") -Force
+          Copy-Item "target/release/viddybud.exe" (Join-Path $pkgDir "viddybud.exe") -Force
 
           $readme = @"
-          f2v Windows Artifact
+          ViddyBud Windows Artifact
           Commit: $env:GITHUB_SHA
           Built at: $(Get-Date -Format o)
 
           Quick start:
           1) Ensure ffmpeg.exe is installed and available in PATH.
           2) Open PowerShell in this folder.
-          3) Run: .\f2v.exe --help
+          3) Run: .\viddybud.exe --help
           "@
           Set-Content -Path (Join-Path $pkgDir "README.txt") -Value $readme
 
-          $zipPath = Join-Path $distRoot "f2v-windows-x64.zip"
+          $zipPath = Join-Path $distRoot "viddybud-windows-x64.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path (Join-Path $pkgDir "*") -DestinationPath $zipPath
 
@@ -91,9 +91,9 @@ jobs:
         run: |
           $extract = "dist/extracted"
           if (Test-Path $extract) { Remove-Item $extract -Recurse -Force }
-          Expand-Archive -Path "dist/f2v-windows-x64.zip" -DestinationPath $extract
-          if (!(Test-Path (Join-Path $extract "f2v.exe"))) {
-            throw "Artifact missing f2v.exe"
+          Expand-Archive -Path "dist/viddybud-windows-x64.zip" -DestinationPath $extract
+          if (!(Test-Path (Join-Path $extract "viddybud.exe"))) {
+            throw "Artifact missing viddybud.exe"
           }
           if (!(Test-Path (Join-Path $extract "README.txt"))) {
             throw "Artifact missing README.txt"
@@ -102,6 +102,6 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: f2v-windows-x64-${{ github.sha }}
-          path: dist/f2v-windows-x64.zip
+          name: viddybud-windows-x64-${{ github.sha }}
+          path: dist/viddybud-windows-x64.zip
           retention-days: 14

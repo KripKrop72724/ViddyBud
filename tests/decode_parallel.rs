@@ -117,7 +117,7 @@ fn parallel_and_sequential_engines_are_byte_identical() {
     let decoded_sequential = tmp.path().join("decoded_sequential");
     write_test_tree(&input);
 
-    let enc = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let enc = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&encoded)
@@ -129,7 +129,7 @@ fn parallel_and_sequential_engines_are_byte_identical() {
         .expect("encode run");
     assert!(enc.status.success(), "{}", combined_output(&enc));
 
-    let dec_parallel = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let dec_parallel = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded_parallel)
@@ -145,7 +145,7 @@ fn parallel_and_sequential_engines_are_byte_identical() {
         combined_output(&dec_parallel)
     );
 
-    let dec_sequential = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let dec_sequential = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded_sequential)
@@ -181,7 +181,7 @@ fn decode_engine_and_crc_mode_are_reflected_in_summary() {
     let decoded_no_crc = tmp.path().join("decoded_no_crc");
     write_test_tree(&input);
 
-    let enc = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let enc = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&encoded)
@@ -193,7 +193,7 @@ fn decode_engine_and_crc_mode_are_reflected_in_summary() {
         .expect("encode run");
     assert!(enc.status.success(), "{}", combined_output(&enc));
 
-    let seq = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let seq = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded_seq)
@@ -214,7 +214,7 @@ fn decode_engine_and_crc_mode_are_reflected_in_summary() {
         "summary missing crc_enabled=true marker: {seq_text}"
     );
 
-    let no_crc = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let no_crc = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded_no_crc)
@@ -256,7 +256,7 @@ fn parallel_decode_with_small_queue_completes() {
         );
     }
 
-    let enc = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let enc = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&encoded)
@@ -268,7 +268,7 @@ fn parallel_decode_with_small_queue_completes() {
         .expect("encode run");
     assert!(enc.status.success(), "{}", combined_output(&enc));
 
-    let dec = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let dec = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&encoded)
         .arg(&decoded)
@@ -311,7 +311,7 @@ fn stitched_file_decode_preserves_bytes_and_reports_source_metrics() {
     let decoded = tmp.path().join("decoded");
     write_test_tree(&input);
 
-    let enc = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let enc = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("encode")
         .arg(&input)
         .arg(&encoded)
@@ -325,7 +325,7 @@ fn stitched_file_decode_preserves_bytes_and_reports_source_metrics() {
     assert!(enc.status.success(), "{}", combined_output(&enc));
 
     let stitched = find_single_mkv(&encoded);
-    let dec = Command::new(assert_cmd::cargo::cargo_bin!("f2v"))
+    let dec = Command::new(assert_cmd::cargo::cargo_bin!("viddybud"))
         .arg("decode")
         .arg(&stitched)
         .arg(&decoded)
