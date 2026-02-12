@@ -215,7 +215,7 @@ pub fn decode_folder(
 
     progress.set_stage("prepare output");
     for d in &manifest.dirs {
-        let p = output_folder.join(d.replace("/", &std::path::MAIN_SEPARATOR.to_string()));
+        let p = output_folder.join(d.replace('/', std::path::MAIN_SEPARATOR_STR));
         std::fs::create_dir_all(&p)?;
     }
 
@@ -230,15 +230,13 @@ pub fn decode_folder(
             .unwrap_or(0)
     ];
     for f in &manifest.files {
-        let out_path = output_folder.join(
-            f.rel_path
-                .replace("/", &std::path::MAIN_SEPARATOR.to_string()),
-        );
+        let out_path = output_folder.join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&out_path)
@@ -310,10 +308,7 @@ pub fn decode_folder(
 
     progress.set_stage("restore mtimes");
     for f in &manifest.files {
-        let out_path = output_folder.join(
-            f.rel_path
-                .replace("/", &std::path::MAIN_SEPARATOR.to_string()),
-        );
+        let out_path = output_folder.join(f.rel_path.replace('/', std::path::MAIN_SEPARATOR_STR));
         let ft = FileTime::from_unix_time(f.mtime_unix, 0);
         let _ = filetime::set_file_mtime(&out_path, ft);
     }
@@ -416,9 +411,8 @@ fn decode_parallel(
     let first_error = Arc::new(Mutex::new(None::<String>));
 
     let per_writer_budget = (runtime.queue_bytes / runtime.writer_workers as u64).max(1);
-    let per_writer_slots = ((per_writer_budget / runtime.batch_bytes as u64)
-        .max(32)
-        .min(4096)) as usize;
+    let per_writer_slots =
+        ((per_writer_budget / runtime.batch_bytes as u64).clamp(32, 4096)) as usize;
 
     let mut writer_txs = Vec::with_capacity(runtime.writer_workers);
     let mut writer_rxs = Vec::with_capacity(runtime.writer_workers);
@@ -657,7 +651,7 @@ fn decode_one_video_parallel(
                 mkv,
                 stream_map
                     .map(|t| format!(" track={}", t))
-                    .unwrap_or_else(String::new)
+                    .unwrap_or_default()
             )
         })?;
 
@@ -809,7 +803,7 @@ fn decode_one_video_parallel(
             mkv.display(),
             stream_map
                 .map(|t| format!(" track={}", t))
-                .unwrap_or_else(String::new),
+                .unwrap_or_default(),
             status,
             frame_counter,
             tail
@@ -1045,6 +1039,7 @@ fn flush_one_batch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_sequential(
     sources: &[DecodeSource],
     w: u32,
@@ -1074,6 +1069,7 @@ fn decode_sequential(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_one_video_sequential(
     source: &DecodeSource,
     w: u32,
@@ -1115,7 +1111,7 @@ fn decode_one_video_sequential(
                 mkv,
                 stream_map
                     .map(|t| format!(" track={}", t))
-                    .unwrap_or_else(String::new)
+                    .unwrap_or_default()
             )
         })?;
 
@@ -1208,7 +1204,7 @@ fn decode_one_video_sequential(
             mkv.display(),
             stream_map
                 .map(|t| format!(" track={}", t))
-                .unwrap_or_else(String::new),
+                .unwrap_or_default(),
             status,
             tail
         );
@@ -1236,17 +1232,17 @@ fn get_or_open_rw_file<'a>(
     file_id: usize,
     path: &Path,
 ) -> Result<&'a mut File> {
-    if !open_files.contains_key(&file_id) {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .with_context(|| format!("open {}", path.display()))?;
-        open_files.insert(file_id, file);
+    match open_files.entry(file_id) {
+        std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("open {}", path.display()))?;
+            Ok(e.insert(file))
+        }
     }
-    open_files
-        .get_mut(&file_id)
-        .context("open file cache insert/read failed")
 }
 
 fn write_all_at(f: &mut File, offset: u64, data: &[u8]) -> Result<()> {

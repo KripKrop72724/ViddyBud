@@ -56,6 +56,7 @@ struct EncodeIoStats {
     fallback_seen: Mutex<HashSet<PathBuf>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn encode_folder(
     input_folder: &Path,
     output_dir: &Path,
@@ -198,7 +199,6 @@ pub fn encode_folder(
             let seg_chunks = seg.clone();
             let manifest_blob = manifest_blob.clone();
             let progress = progress.clone();
-            let dataset_id = dataset_id;
             let mode = mode.to_string();
             let w = tune.frame_w;
             let h = tune.frame_h;

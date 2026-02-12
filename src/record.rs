@@ -52,6 +52,7 @@ pub struct RecordParser {
     state: State,
 }
 
+#[allow(clippy::enum_variant_names)]
 enum State {
     NeedKind,
     NeedHeader,
