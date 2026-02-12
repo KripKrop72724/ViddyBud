@@ -4,6 +4,11 @@ All notable changes to ViddyBud will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows SemVer.
 
+## [0.1.4] - 2026-02-12
+
+### Fixed
+- Release workflow Windows packaging now locates the built `viddybud.exe` reliably across Cargo output layouts.
+
 ## [0.1.3] - 2026-02-12
 
 ### Fixed

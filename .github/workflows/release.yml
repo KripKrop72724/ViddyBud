@@ -125,13 +125,27 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $version = "${{ needs.validate_version.outputs.version }}"
           $target = "${{ matrix.target }}"
           $dist = "dist"
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
-          $srcExe = "target/$target/release/viddybud.exe"
-          $verExe = "$dist/viddybud-v$version-windows-x64.exe"
+          $candidates = @(
+            (Join-Path "target" (Join-Path $target (Join-Path "release" "viddybud.exe"))),
+            (Join-Path "target" (Join-Path "release" "viddybud.exe"))
+          )
+          $srcExe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $srcExe) {
+            Write-Host "Expected viddybud.exe not found. Searched:"
+            $candidates | ForEach-Object { Write-Host " - $_" }
+            Write-Host "Found these viddybud.exe paths under target/:"
+            Get-ChildItem -Path "target" -Recurse -Filter "viddybud.exe" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host $_.FullName }
+            throw "missing viddybud.exe"
+          }
+
+          $verExe = Join-Path $dist "viddybud-v$version-windows-x64.exe"
           Copy-Item $srcExe $verExe -Force
 
           $pkgDir = Join-Path $dist "viddybud-windows-x64"
@@ -150,11 +164,11 @@ jobs:
           "@
           Set-Content -Path (Join-Path $pkgDir "README.txt") -Value $readme
 
-          $zipPath = "$dist/viddybud-v$version-windows-x64.zip"
+          $zipPath = Join-Path $dist "viddybud-v$version-windows-x64.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
           Compress-Archive -Path (Join-Path $pkgDir "*") -DestinationPath $zipPath
 
-          .\target\$target\release\viddybud.exe --version | Out-Null
+          & $srcExe --version | Out-Null
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
