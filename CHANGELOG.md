@@ -4,6 +4,11 @@ All notable changes to ViddyBud will be documented in this file.
 
 The format is based on Keep a Changelog, and this project follows SemVer.
 
+## [0.1.2] - 2026-02-12
+
+### Fixed
+- `Cargo.lock` updated so CI/release builds using `--locked` work correctly.
+
 ## [0.1.1] - 2026-02-12
 
 ### Fixed
