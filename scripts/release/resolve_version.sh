@@ -9,7 +9,8 @@ if [[ ! -f "$cargo_toml" ]]; then
 fi
 
 cargo_version="$(
-  sed -n 's/^version = \"\\([0-9][0-9]*\\.[0-9][0-9]*\\.[0-9][0-9]*\\)\"$/\\1/p' "$cargo_toml" | head -n 1
+  # Use BRE-compatible capture groups so this works on both GNU and BSD sed.
+  sed -n 's/^version = "\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/\1/p' "$cargo_toml" | head -n 1
 )"
 if [[ -z "$cargo_version" ]]; then
   echo "could not parse version from $cargo_toml" >&2
@@ -47,4 +48,3 @@ else
   echo "tag=$tag"
   echo "version=$version"
 fi
-
